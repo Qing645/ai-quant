@@ -1,0 +1,1280 @@
+<script setup lang="ts">
+import { ref, onMounted, nextTick } from "vue";
+import * as echarts from "echarts";
+import {
+  Play,
+  TrendingUp,
+  Cpu,
+  BarChart3,
+  Loader2,
+  List,
+  Activity,
+  DollarSign,
+  Award,
+  ShieldAlert,
+  Trash2,
+  Star
+} from "lucide-vue-next";
+
+const chartRef = ref<HTMLElement | null>(null);
+const isLoading = ref(false);
+const symbol = ref("");
+const startDate = ref("2020-01-01");
+const endDate = ref(new Date().toISOString().split("T")[0]);
+const metrics = ref({
+  total_return: 0,
+  annual_return: 0,
+  sharpe_ratio: 0,
+  max_drawdown: 0,
+  win_rate: 0,
+  profit_loss_ratio: 0,
+  trade_count: 0,
+  final_value: 0
+});
+const trades = ref<any[]>([]);
+const stockInfo = ref({
+  name: "",
+  sector: "",
+  industry: "",
+  currency: "",
+  exchange: "",
+  summary: ""
+});
+const statusMsg = ref("就绪");
+const predictionDays = ref(30);
+const stopLoss = ref(-10); // 百分比显示，发送时除以 100
+const gracePeriod = ref(3);
+const lastSignal = ref({ date: "N/A", signal: 0, price: 0, status: "loading" });
+const realtimeSignal = ref<any>(null);
+const backtestHistory = ref<any[]>([]);
+const watchlist = ref<any[]>([]);
+const chartMode = ref<"daily" | "intraday">("daily");
+const intradayData = ref<any[]>([]);
+const isIntradayLoading = ref(false);
+const isWatchlistLoading = ref(false);
+const isStockInfoLoading = ref(false);
+const isChartDataLoading = ref(false);
+const isMetricsLoading = ref(false);
+const isTradesLoading = ref(false);
+const isSignalLoading = ref(false);
+const isHistoryLoading = ref(false);
+let realtimeTimer: any = null;
+
+// 通用带鉴权的请求方法
+const fetchWithAuth = async (url: string, options: RequestInit = {}) => {
+  const token = localStorage.getItem("token");
+  const headers = {
+    ...options.headers,
+    Authorization: token ? `Bearer ${token}` : ""
+  };
+
+  const res = await fetch(url, { ...options, headers });
+
+  if (res.status === 401) {
+    // Token 失效或未登录，清理并刷新页面触发 App.vue 的跳转
+    localStorage.removeItem("token");
+    localStorage.removeItem("username");
+    window.location.reload();
+    throw new Error("请重新登录");
+  }
+
+  return res;
+};
+
+let myChart: echarts.ECharts | null = null;
+
+const runPipeline = async () => {
+  isLoading.value = true;
+  statusMsg.value = `正在下载 ${symbol.value} 数据并运行管线...`;
+  try {
+    const params = new URLSearchParams({
+      symbol: symbol.value,
+      start: startDate.value,
+      end: endDate.value,
+      prediction_days: predictionDays.value.toString(),
+      stop_loss: (stopLoss.value / 100).toString(),
+      grace_period: gracePeriod.value.toString()
+    });
+
+    const res = await fetchWithAuth(`/api/run-pipeline?${params.toString()}`, {
+      method: "POST"
+    });
+    if (!res.ok) {
+      const errorData = await res.json();
+      throw new Error(errorData.detail || "运行失败");
+    }
+    statusMsg.value = "回测完成，正在同步数据...";
+    await Promise.all([
+      fetchStockInfo(),
+      fetchChartData(),
+      fetchMetrics(),
+      fetchTrades(),
+      fetchLastSignal(),
+      fetchHistory()
+    ]);
+    startRealtimeMonitor();
+    statusMsg.value = "已更新";
+  } catch (err: any) {
+    console.error("Pipeline failed:", err);
+    statusMsg.value = `错误: ${err.message}`;
+    alert(
+      `回测失败: ${err.message}\n提示: 如果样本量过少，请尝试扩大日期范围。`
+    );
+  } finally {
+    isLoading.value = false;
+  }
+};
+
+const fetchStockInfo = async () => {
+  try {
+    isStockInfoLoading.value = true;
+    const res = await fetchWithAuth(`/api/stock/info?symbol=${symbol.value}`);
+    stockInfo.value = await res.json();
+  } catch (err) {
+    console.error("获取股票信息失败", err);
+  } finally {
+    isStockInfoLoading.value = false;
+  }
+};
+
+const fetchChartData = async () => {
+  try {
+    isChartDataLoading.value = true;
+    const res = await fetchWithAuth("/api/data/chart");
+    const data = await res.json();
+    renderChart(data);
+  } catch (err) {
+    console.error("获取图表数据失败", err);
+  } finally {
+    isChartDataLoading.value = false;
+  }
+};
+
+const fetchIntradayData = async () => {
+  try {
+    isIntradayLoading.value = true;
+    const res = await fetchWithAuth(
+      `/api/data/intraday?symbol=${symbol.value}`
+    );
+    const resData = await res.json();
+    if (resData && Array.isArray(resData.data)) {
+      intradayData.value = resData.data;
+      if (resData.prev_close) {
+        (intradayData.value as any).prev_close = resData.prev_close;
+      }
+    } else {
+      intradayData.value = resData;
+    }
+    renderChart(intradayData.value);
+  } catch (err) {
+    console.error("获取分时数据失败", err);
+  } finally {
+    isIntradayLoading.value = false;
+  }
+};
+
+const setChartMode = (mode: "daily" | "intraday") => {
+  chartMode.value = mode;
+  if (mode === "daily") {
+    fetchChartData();
+  } else {
+    fetchIntradayData();
+  }
+};
+
+const fetchMetrics = async () => {
+  try {
+    isMetricsLoading.value = true;
+    const res = await fetchWithAuth("/api/model/metrics");
+    metrics.value = await res.json();
+  } catch (err) {
+    console.error("获取指标失败", err);
+  } finally {
+    isMetricsLoading.value = false;
+  }
+};
+
+const fetchTrades = async () => {
+  try {
+    isTradesLoading.value = true;
+    const res = await fetchWithAuth("/api/backtest/trades");
+    const data = await res.json();
+    trades.value = data.reverse(); // 最新的在上面
+  } catch (err) {
+    console.error("获取交易日志失败", err);
+  } finally {
+    isTradesLoading.value = false;
+  }
+};
+
+const fetchLastSignal = async () => {
+  try {
+    isSignalLoading.value = true;
+    const res = await fetchWithAuth("/api/last-signal");
+    lastSignal.value = await res.json();
+  } catch (err) {
+    console.error("获取最新信号失败", err);
+  } finally {
+    isSignalLoading.value = false;
+  }
+};
+
+const isTradingHours = () => {
+  const now = new Date();
+  const day = now.getDay();
+  if (day === 0 || day === 6) return false; // 周末
+
+  const time = now.getHours() * 100 + now.getMinutes();
+  // 9:30-11:30, 13:00-15:00
+  if ((time >= 930 && time <= 1130) || (time >= 1300 && time <= 1500)) {
+    return true;
+  }
+  return false;
+};
+
+const fetchRealtimeCheck = async () => {
+  if (!symbol.value) return;
+  if (!isTradingHours()) {
+    console.log("非交易时间，暂停获取实时行情。");
+    return;
+  }
+
+  try {
+    const res = await fetchWithAuth(
+      `/api/realtime/check?symbol=${symbol.value}`
+    );
+    const data = await res.json();
+    if (data.status === "success") {
+      realtimeSignal.value = data;
+      // 如果在分时模式，自动刷新分时数据
+      if (chartMode.value === "intraday") {
+        const iRes = await fetchWithAuth(
+          `/api/data/intraday?symbol=${symbol.value}`
+        );
+        intradayData.value = await iRes.json();
+        renderChart(intradayData.value);
+      }
+    }
+  } catch (err) {
+    console.error("实时诊断失败", err);
+  }
+};
+
+const startRealtimeMonitor = () => {
+  if (realtimeTimer) clearInterval(realtimeTimer);
+  fetchRealtimeCheck(); // 立即执行一次
+  realtimeTimer = setInterval(fetchRealtimeCheck, 30000); // 30秒轮询
+};
+
+const fetchHistory = async () => {
+  try {
+    isHistoryLoading.value = true;
+    const res = await fetchWithAuth("/api/backtest/history");
+    backtestHistory.value = await res.json();
+  } catch (err) {
+    console.error("获取回测历史失败", err);
+  } finally {
+    isHistoryLoading.value = false;
+  }
+};
+
+const fetchWatchlist = async () => {
+  try {
+    const res = await fetchWithAuth("/api/watchlist");
+    watchlist.value = await res.json();
+  } catch (err) {
+    console.error("获取自选失败", err);
+  }
+};
+
+const toggleWatchlistBySymbol = async (targetSymbol: string) => {
+  if (isWatchlistLoading.value) return;
+  const upperSymbol = targetSymbol.toUpperCase();
+  const isFavorite = watchlist.value.some(
+    (w) => w.symbol.toUpperCase() === upperSymbol
+  );
+  try {
+    isWatchlistLoading.value = true;
+    statusMsg.value = isFavorite ? "正在取消收藏..." : "正在加入自选...";
+    if (isFavorite) {
+      await fetchWithAuth(`/api/watchlist/${upperSymbol}`, {
+        method: "DELETE"
+      });
+      statusMsg.value = "已从自选移除";
+    } else {
+      await fetchWithAuth(`/api/watchlist?symbol=${upperSymbol}`, {
+        method: "POST"
+      });
+      statusMsg.value = "已加入自选";
+    }
+    await fetchWatchlist();
+  } catch (err) {
+    console.error("同步自选失败", err);
+    statusMsg.value = "同步自选失败";
+  } finally {
+    isWatchlistLoading.value = false;
+  }
+};
+
+const deleteHistory = async (id: number, e: Event) => {
+  e.stopPropagation(); // 防止触发点击切换标的
+  if (!confirm("确定要删除这条历史记录吗？")) return;
+  try {
+    const res = await fetchWithAuth(`/api/backtest/history/${id}`, {
+      method: "DELETE"
+    });
+    if (res.ok) {
+      await fetchHistory();
+    }
+  } catch (err) {
+    console.error("删除失败", err);
+  }
+};
+
+const renderChart = (data: any[]) => {
+  if (!chartRef.value) return;
+  if (!myChart) myChart = echarts.init(chartRef.value);
+
+  const isDaily = chartMode.value === "daily";
+  const dates = data.map((d) => (isDaily ? d.date : d.time));
+
+  // 处理序列数据
+  const kData = isDaily
+    ? data.map((d) => [
+        parseFloat(d.open),
+        parseFloat(d.close),
+        parseFloat(d.low),
+        parseFloat(d.high)
+      ])
+    : [];
+
+  const lineData = isDaily ? [] : data.map((d) => parseFloat(d.price));
+
+  const volumes = data.map((d, i) => ({
+    value: parseFloat(d.volume),
+    itemStyle: {
+      color: isDaily ? (d.close >= d.open ? "#ef4444" : "#10b981") : "#3b82f6" // 分时颜色统一蓝色或根据涨跌
+    }
+  }));
+
+  const portfolio = isDaily ? data.map((d) => d.portfolio_value) : [];
+  const ma20 = isDaily ? data.map((d) => d.sma_20 || null) : [];
+  const ma50 = isDaily ? data.map((d) => d.sma_50 || null) : [];
+
+  const markPoints: any[] = [];
+  if (isDaily) {
+    data.forEach((d, i) => {
+      const prevSignal = i > 0 ? data[i - 1].predicted_signal : 0;
+      if (d.predicted_signal === 1 && prevSignal === 0) {
+        markPoints.push({
+          name: "BUY",
+          value: "B",
+          xAxis: i,
+          yAxis: d.low,
+          itemStyle: { color: "#10b981" }
+        });
+      } else if (d.predicted_signal === 0 && prevSignal === 1) {
+        markPoints.push({
+          name: "SELL",
+          value: "S",
+          xAxis: i,
+          yAxis: d.high,
+          itemStyle: { color: "#ef4444" }
+        });
+      }
+    });
+  }
+
+  const option: any = {
+    backgroundColor: "transparent",
+    tooltip: {
+      trigger: "axis",
+      axisPointer: { type: "cross" },
+      backgroundColor: "#1e293b",
+      borderColor: "#334155",
+      textStyle: { color: "#e2e8f0" },
+      formatter: function (params: any) {
+        let res = `<div style="font-weight:bold;margin-bottom:4px;border-bottom:1px solid #334155;padding-bottom:2px;">${params[0].axisValue}</div>`;
+        let dataIndex = params[0].dataIndex;
+        let prevClose = isDaily
+          ? dataIndex > 0
+            ? data[dataIndex - 1].close
+            : data[0].open
+          : (data as any).prev_close
+            ? (data as any).prev_close
+            : realtimeSignal.value && realtimeSignal.value.prev_close
+              ? realtimeSignal.value.prev_close
+              : data[0].price; // 分时图优先取数据内含的昨收，其次取诊断返回的昨收，否则降级取首笔交易价
+
+        let currentClose = isDaily
+          ? data[dataIndex].close
+          : data[dataIndex].price;
+
+        // 转为数值类型，防御性处理可能出现的 string 或 undefined
+        const pClose = Number(prevClose);
+        const cClose = Number(currentClose);
+
+        if (!isNaN(pClose) && pClose > 0 && !isNaN(cClose)) {
+          let changeStr = (((cClose - pClose) / pClose) * 100).toFixed(2);
+          let changeNum = Number(changeStr);
+          let color = changeNum >= 0 ? "#10b981" : "#ef4444";
+          let sign = changeNum > 0 ? "+" : "";
+          res += `<div style="margin-bottom: 4px;"><span style="color: ${color}; font-weight: bold; font-size: 13px;">涨幅: ${sign}${changeStr}%</span></div>`;
+        }
+
+        params.forEach((item: any) => {
+          if (item.seriesName === "K线") {
+            res += `<div style="font-size: 12px; margin-top: 4px;">`;
+            res += `${item.marker} 开盘: <b>${item.data[1]}</b> &nbsp;&nbsp; ${item.marker} 收盘: <b>${item.data[2]}</b><br/>`;
+            res += `${item.marker} 最低: <b>${item.data[3]}</b> &nbsp;&nbsp; ${item.marker} 最高: <b>${item.data[4]}</b>`;
+            res += `</div>`;
+          } else if (item.seriesName === "分时") {
+            res += `${item.marker} 价格: <b>${item.data}</b><br/>`;
+          } else if (item.seriesName === "成交量") {
+            let vol =
+              item.data.value !== undefined ? item.data.value : item.data;
+            res += `${item.marker} ${item.seriesName}: <b>${vol}</b><br/>`;
+          } else {
+            if (
+              item.data !== undefined &&
+              item.data !== null &&
+              !isNaN(item.data)
+            ) {
+              res += `${item.marker} ${item.seriesName}: <b>${Number(item.data).toFixed(2)}</b><br/>`;
+            }
+          }
+        });
+        return res;
+      }
+    },
+    axisPointer: { link: [{ xAxisIndex: "all" }] },
+    legend: {
+      show: isDaily,
+      textStyle: { color: "#94a3b8" },
+      top: 0,
+      data: ["K线", "MA20", "MA50", "成交量", "账户净值"]
+    },
+    grid: [
+      { left: "4%", right: "4%", top: "10%", height: isDaily ? "60%" : "70%" },
+      { left: "4%", right: "4%", top: "75%", height: "15%" }
+    ],
+    xAxis: [
+      {
+        type: "category",
+        data: dates,
+        boundaryGap: isDaily,
+        axisLine: { lineStyle: { color: "#334155" } },
+        axisLabel: { color: "#64748b" }
+      },
+      {
+        type: "category",
+        gridIndex: 1,
+        data: dates,
+        boundaryGap: isDaily,
+        axisLine: { lineStyle: { color: "#334155" } },
+        axisLabel: { show: false }
+      }
+    ],
+    yAxis: [
+      {
+        scale: true,
+        splitLine: { lineStyle: { color: "#1e293b" } },
+        axisLabel: { color: "#64748b" }
+      },
+      {
+        scale: true,
+        gridIndex: 1,
+        splitNumber: 2,
+        axisLabel: { show: false },
+        axisLine: { show: false },
+        splitLine: { show: false }
+      },
+      {
+        type: "value",
+        show: isDaily,
+        name: "净值",
+        position: "right",
+        splitLine: { show: false },
+        axisLabel: { color: "#10b981" }
+      }
+    ],
+    dataZoom: [
+      {
+        type: "inside",
+        xAxisIndex: [0, 1],
+        start: dates.length > 50 ? 70 : 0,
+        end: 100
+      },
+      {
+        type: "slider",
+        xAxisIndex: [0, 1],
+        bottom: 10,
+        start: dates.length > 50 ? 70 : 0,
+        end: 100,
+        backgroundColor: "rgba(30, 41, 59, 0.4)",
+        fillerColor: "rgba(59, 130, 246, 0.1)",
+        borderColor: "transparent"
+      }
+    ],
+    series: [
+      isDaily
+        ? {
+            name: "K线",
+            type: "candlestick",
+            data: kData,
+            itemStyle: {
+              color: "#ef4444",
+              color0: "#10b981",
+              borderColor: "#ef4444",
+              borderColor0: "#10b981"
+            },
+            markPoint: {
+              symbol: "pin",
+              symbolSize: 30,
+              data: markPoints,
+              label: { show: true, fontSize: 10, color: "#fff" }
+            }
+          }
+        : {
+            name: "分时",
+            type: "line",
+            data: lineData,
+            smooth: true,
+            symbol: "none",
+            lineStyle: { color: "#3b82f6", width: 2 },
+            areaStyle: {
+              color: new echarts.graphic.LinearGradient(0, 0, 0, 1, [
+                { offset: 0, color: "rgba(59, 130, 246, 0.4)" },
+                { offset: 1, color: "rgba(59, 130, 246, 0)" }
+              ])
+            }
+          },
+      {
+        name: "MA20",
+        type: "line",
+        data: ma20,
+        smooth: true,
+        lineStyle: { opacity: 0.5, width: 1 },
+        symbol: "none"
+      },
+      {
+        name: "MA50",
+        type: "line",
+        data: ma50,
+        smooth: true,
+        lineStyle: { opacity: 0.5, width: 1 },
+        symbol: "none"
+      },
+      {
+        name: "成交量",
+        type: "bar",
+        xAxisIndex: 1,
+        yAxisIndex: 1,
+        data: volumes
+      },
+      {
+        name: "账户净值",
+        type: "line",
+        data: portfolio,
+        yAxisIndex: 2,
+        smooth: true,
+        symbol: "none",
+        itemStyle: { color: "#10b981" },
+        lineStyle: { width: 2 }
+      }
+    ]
+  };
+  myChart.setOption(option, true);
+};
+
+onMounted(() => {
+  if (symbol.value) {
+    fetchStockInfo();
+    fetchChartData();
+    fetchMetrics();
+    fetchTrades();
+    fetchLastSignal();
+    startRealtimeMonitor();
+  }
+  fetchHistory();
+  fetchWatchlist();
+  window.addEventListener("resize", () => myChart?.resize());
+});
+
+import { onUnmounted } from "vue";
+onUnmounted(() => {
+  if (realtimeTimer) clearInterval(realtimeTimer);
+});
+</script>
+
+<template>
+  <div class="space-y-6 relative">
+    <!-- 全局 Pipeline 运行遮罩（回测期间禁止所有面板操作） -->
+    <div
+      v-if="isLoading"
+      class="fixed inset-0 z-50 bg-slate-950/40 backdrop-blur-[2px] cursor-not-allowed"
+      style="pointer-events: all"
+    >
+      <div
+        class="absolute top-6 left-1/2 -translate-x-1/2 flex items-center gap-3 px-6 py-3 bg-slate-900/90 border border-emerald-500/30 rounded-2xl shadow-2xl shadow-emerald-500/10"
+      >
+        <Loader2 class="w-5 h-5 animate-spin text-emerald-400" />
+        <span class="text-sm font-bold text-emerald-400">{{ statusMsg }}</span>
+      </div>
+    </div>
+    <!-- 股票概况 Header -->
+    <div
+      v-if="stockInfo.name"
+      class="glass p-6 rounded-[2rem] border border-white/10 flex flex-col md:flex-row justify-between items-start md:items-center gap-4 relative overflow-hidden"
+    >
+      <div class="relative z-10">
+        <h1
+          class="text-3xl font-black tracking-tighter text-white flex items-center gap-3"
+        >
+          {{ stockInfo.name }}
+          <span
+            class="text-sm font-mono px-2 py-0.5 bg-emerald-500/20 text-emerald-400 rounded-md border border-emerald-500/30 uppercase"
+            >{{ symbol }}</span
+          >
+          <button
+            @click="toggleWatchlistBySymbol(symbol)"
+            :disabled="isWatchlistLoading"
+            class="flex items-center gap-2 px-3 py-1.5 rounded-full border transition-all text-xs font-bold"
+            :class="[
+              watchlist.some((w) => w.symbol === symbol)
+                ? 'bg-amber-500/20 border-amber-500/50 text-amber-400'
+                : 'bg-white/5 border-white/10 text-slate-400 hover:bg-white/10',
+              isWatchlistLoading ? 'opacity-50 cursor-not-allowed' : ''
+            ]"
+          >
+            <Star
+              class="w-4 h-4"
+              :class="{
+                'fill-current': watchlist.some((w) => w.symbol === symbol)
+              }"
+            />
+            {{
+              watchlist.some((w) => w.symbol === symbol)
+                ? "已在自选"
+                : "加入自选"
+            }}
+          </button>
+        </h1>
+        <div class="flex gap-4 mt-2 text-slate-400 text-sm">
+          <span class="flex items-center gap-1"
+            ><Activity class="w-4 h-4 text-blue-400" />
+            {{ stockInfo.sector }}</span
+          >
+          <span class="flex items-center gap-1"
+            ><BarChart3 class="w-4 h-4 text-indigo-400" />
+            {{ stockInfo.industry }}</span
+          >
+          <span class="flex items-center gap-1"
+            ><DollarSign class="w-4 h-4 text-emerald-400" />
+            {{ stockInfo.currency }} / {{ stockInfo.exchange }}</span
+          >
+        </div>
+      </div>
+      <div
+        class="max-w-md text-slate-500 text-xs leading-relaxed italic relative z-10 hidden lg:block"
+      >
+        {{ stockInfo.summary }}
+      </div>
+      <!-- 装饰背景 -->
+      <div
+        class="absolute -right-20 -top-20 w-64 h-64 bg-blue-600/10 blur-[80px] rounded-full"
+      ></div>
+    </div>
+
+    <!-- AI 实时决策提醒 -->
+    <div
+      v-if="lastSignal.date !== 'N/A'"
+      class="glass p-4 rounded-2xl border flex flex-col md:flex-row items-center justify-between gap-4 transition-all duration-500 overflow-hidden relative"
+      :class="{
+        'border-emerald-500/30 bg-emerald-500/5': lastSignal.signal === 1,
+        'border-rose-500/30 bg-rose-500/5':
+          lastSignal.signal === 0 &&
+          trades.length > 0 &&
+          trades[0].type === 'BUY',
+        'border-white/10':
+          lastSignal.signal === 0 &&
+          (trades.length === 0 || trades[0].type === 'SELL')
+      }"
+    >
+      <div class="flex items-center gap-4 relative z-10">
+        <div
+          class="w-12 h-12 rounded-full flex items-center justify-center shadow-lg"
+          :class="{
+            'bg-emerald-500 shadow-emerald-500/20 text-white':
+              lastSignal.signal === 1,
+            'bg-rose-500 shadow-rose-500/20 text-white':
+              lastSignal.signal === 0 &&
+              trades.length > 0 &&
+              trades[0].type === 'BUY',
+            'bg-slate-700 text-slate-400':
+              lastSignal.signal === 0 &&
+              (trades.length === 0 || trades[0].type === 'SELL')
+          }"
+        >
+          <TrendingUp v-if="lastSignal.signal === 1" class="w-6 h-6" />
+          <ShieldAlert
+            v-else-if="
+              lastSignal.signal === 0 &&
+              trades.length > 0 &&
+              trades[0].type === 'BUY'
+            "
+            class="w-6 h-6"
+          />
+          <Activity v-else class="w-6 h-6" />
+        </div>
+        <div>
+          <h4
+            class="text-xs font-bold uppercase tracking-widest text-slate-500 mb-1 flex items-center gap-1"
+          >
+            AI 实时决策建议
+            <Loader2 v-if="isSignalLoading" class="w-3 h-3 animate-spin" />
+          </h4>
+          <div class="text-xl font-black flex items-center gap-2">
+            <!-- 优先显示实时分时诊断信号 -->
+            <template v-if="realtimeSignal">
+              <span
+                v-if="realtimeSignal.ai_signal === 1"
+                class="text-emerald-400 animate-pulse"
+              >
+                分时看多：建议介入
+              </span>
+              <span
+                v-else-if="realtimeSignal.ai_signal === -1"
+                class="text-rose-400 animate-pulse"
+              >
+                分时看空：建议离场
+              </span>
+              <span v-else class="text-slate-400"> 分时震荡：保持观望 </span>
+            </template>
+            <!-- 降级显示回测最后信号 -->
+            <template v-else-if="lastSignal.signal === 1">
+              <span class="text-emerald-400">长期看多：持仓/买入</span>
+            </template>
+            <template
+              v-else-if="
+                lastSignal.signal === 0 &&
+                trades.length > 0 &&
+                trades[0].type === 'BUY'
+              "
+            >
+              <span class="text-rose-400">长期走弱：逢高减仓</span>
+            </template>
+            <template v-else>
+              <span class="text-slate-300">空仓观望</span>
+            </template>
+          </div>
+        </div>
+      </div>
+      <div class="text-right relative z-10">
+        <div class="text-[10px] text-slate-500 uppercase font-mono mb-1">
+          参考价 ({{ lastSignal.date }})
+        </div>
+        <div class="text-2xl font-mono font-bold text-white">
+          ${{ realtimeSignal?.current_price || lastSignal.price }}
+        </div>
+        <div
+          v-if="realtimeSignal"
+          class="text-[9px] font-mono text-slate-500 mt-1"
+        >
+          置信度: {{ (realtimeSignal.ai_confidence * 100).toFixed(1) }}% (刷新于
+          {{ realtimeSignal.updated_at }})
+        </div>
+      </div>
+      <!-- 动态波纹背景 -->
+      <div
+        v-if="lastSignal.signal === 1"
+        class="absolute -right-10 -bottom-10 w-32 h-32 bg-emerald-500/10 blur-2xl rounded-full animate-pulse"
+      ></div>
+    </div>
+
+    <!-- 顶栏指标卡片 -->
+    <div class="grid grid-cols-2 md:grid-cols-4 lg:grid-cols-8 gap-3 relative">
+      <!-- 加载遮罩 -->
+      <div
+        v-if="isMetricsLoading"
+        class="absolute inset-0 z-10 bg-slate-950/50 backdrop-blur-sm rounded-2xl flex items-center justify-center"
+      >
+        <Loader2 class="w-5 h-5 animate-spin text-emerald-400" />
+      </div>
+      <div class="glass p-3 rounded-2xl flex flex-col justify-between">
+        <span
+          class="text-slate-500 text-[10px] flex items-center gap-1 uppercase tracking-tighter"
+          ><Award class="w-3 h-3" /> 累计收益</span
+        >
+        <span
+          class="text-lg font-bold font-mono"
+          :class="
+            metrics.total_return >= 0 ? 'text-emerald-400' : 'text-rose-400'
+          "
+        >
+          {{ metrics.total_return }}%
+        </span>
+      </div>
+      <div class="glass p-3 rounded-2xl flex flex-col justify-between">
+        <span
+          class="text-slate-500 text-[10px] flex items-center gap-1 uppercase tracking-tighter"
+          ><Activity class="w-3 h-3" /> 夏普比率</span
+        >
+        <span class="text-lg font-bold font-mono text-blue-400">{{
+          metrics.sharpe_ratio
+        }}</span>
+      </div>
+      <div class="glass p-3 rounded-2xl flex flex-col justify-between">
+        <span
+          class="text-slate-500 text-[10px] flex items-center gap-1 uppercase tracking-tighter"
+          ><ShieldAlert class="w-3 h-3" /> 最大回撤</span
+        >
+        <span class="text-lg font-bold font-mono text-rose-400"
+          >{{ metrics.max_drawdown }}%</span
+        >
+      </div>
+      <div class="glass p-3 rounded-2xl flex flex-col justify-between">
+        <span
+          class="text-slate-500 text-[10px] flex items-center gap-1 uppercase tracking-tighter"
+          ><TrendingUp class="w-3 h-3" /> 年化收益</span
+        >
+        <span class="text-lg font-bold font-mono text-emerald-400"
+          >{{ metrics.annual_return }}%</span
+        >
+      </div>
+      <div class="glass p-3 rounded-2xl flex flex-col justify-between">
+        <span
+          class="text-slate-500 text-[10px] flex items-center gap-1 uppercase tracking-tighter"
+          ><Activity class="w-3 h-3" /> 胜率</span
+        >
+        <span class="text-lg font-bold font-mono text-amber-400"
+          >{{ metrics.win_rate }}%</span
+        >
+      </div>
+      <div class="glass p-3 rounded-2xl flex flex-col justify-between">
+        <span
+          class="text-slate-500 text-[10px] flex items-center gap-1 uppercase tracking-tighter"
+          ><BarChart3 class="w-3 h-3" /> 盈亏比</span
+        >
+        <span class="text-lg font-bold font-mono text-indigo-400">{{
+          metrics.profit_loss_ratio
+        }}</span>
+      </div>
+      <div class="glass p-3 rounded-2xl flex flex-col justify-between">
+        <span
+          class="text-slate-500 text-[10px] flex items-center gap-1 uppercase tracking-tighter"
+          ><List class="w-3 h-3" /> 交易次数</span
+        >
+        <span class="text-lg font-bold font-mono text-slate-300">{{
+          metrics.trade_count
+        }}</span>
+      </div>
+      <div class="glass p-3 rounded-2xl flex flex-col justify-between">
+        <span
+          class="text-slate-500 text-[10px] flex items-center gap-1 uppercase tracking-tighter"
+          ><DollarSign class="w-3 h-3" /> 最终净值</span
+        >
+        <span class="text-lg font-bold font-mono text-white"
+          >${{ metrics.final_value }}</span
+        >
+      </div>
+    </div>
+
+    <div class="grid grid-cols-1 lg:grid-cols-4 gap-6">
+      <!-- 侧边控制栏 -->
+      <div class="lg:col-span-1 space-y-6">
+        <!-- 我的自选 (移至顶部) -->
+        <div
+          class="glass p-5 rounded-3xl border border-white/5 flex flex-col gap-3 min-h-[140px]"
+        >
+          <h3
+            class="text-sm font-bold flex items-center gap-2 text-slate-400 uppercase tracking-widest"
+          >
+            <Star class="w-4 h-4 text-amber-400" /> 我的自选
+          </h3>
+          <div class="flex flex-wrap gap-2 overflow-y-auto pr-2 scrollbar-none">
+            <div
+              v-if="watchlist.length === 0"
+              class="text-slate-600 text-center py-4 text-[10px] italic w-full"
+            >
+              暂无收藏标的
+            </div>
+            <div
+              v-for="w in watchlist"
+              :key="w.symbol"
+              class="px-3 py-1.5 bg-white/5 hover:bg-amber-500/10 border border-white/5 hover:border-amber-500/30 rounded-full cursor-pointer transition-all group flex items-center gap-2"
+              @click="symbol = w.symbol"
+            >
+              <span class="text-xs font-mono font-bold">{{ w.symbol }}</span>
+              <button
+                @click.stop="toggleWatchlistBySymbol(w.symbol)"
+                class="opacity-0 group-hover:opacity-100 text-slate-500 hover:text-rose-400 transition-all"
+              >
+                <Trash2 class="w-2.5 h-2.5" />
+              </button>
+            </div>
+          </div>
+        </div>
+
+        <div class="glass p-6 rounded-3xl border border-white/5">
+          <h3 class="text-xl font-semibold mb-6 flex items-center gap-2">
+            <Cpu class="w-5 h-5 text-emerald-400" /> 控制面板
+          </h3>
+          <div class="space-y-4">
+            <div>
+              <label
+                class="block text-[10px] text-slate-500 mb-2 uppercase tracking-widest font-bold"
+                >股票代码</label
+              >
+              <input
+                v-model="symbol"
+                type="text"
+                class="w-full bg-slate-950 border border-white/10 rounded-xl px-4 py-3 text-sm focus:outline-none focus:border-emerald-500 transition-all uppercase font-mono"
+              />
+            </div>
+            <div>
+              <label
+                class="block text-[10px] text-slate-500 mb-2 uppercase tracking-widest font-bold"
+                >回测时间</label
+              >
+              <div class="space-y-2">
+                <input
+                  v-model="startDate"
+                  type="date"
+                  class="w-full bg-slate-950 border border-white/10 rounded-xl px-4 py-2 text-xs focus:outline-none focus:border-emerald-500 transition-all text-slate-300"
+                />
+                <input
+                  v-model="endDate"
+                  type="date"
+                  class="w-full bg-slate-950 border border-white/10 rounded-xl px-4 py-2 text-xs focus:outline-none focus:border-emerald-500 transition-all text-slate-300"
+                />
+              </div>
+            </div>
+
+            <p
+              class="text-[10px] text-slate-500 text-center font-mono uppercase tracking-tighter"
+            >
+              Status: {{ statusMsg }}
+            </p>
+          </div>
+        </div>
+
+        <!-- 策略微调面板 -->
+        <div class="glass p-6 rounded-3xl border border-white/5">
+          <h3 class="text-xl font-semibold mb-6 flex items-center gap-2">
+            <ShieldAlert class="w-5 h-5 text-indigo-400" /> 策略配置
+          </h3>
+          <div class="space-y-6">
+            <div class="space-y-3">
+              <div class="flex justify-between items-center">
+                <label
+                  class="text-[10px] text-slate-500 uppercase font-bold tracking-widest"
+                  >预测周期 (天)</label
+                >
+                <span class="text-xs font-mono text-indigo-400"
+                  >{{ predictionDays }}d</span
+                >
+              </div>
+              <input
+                v-model.number="predictionDays"
+                type="range"
+                min="5"
+                max="30"
+                step="1"
+                class="w-full accent-indigo-500 h-1 bg-slate-800 rounded-lg appearance-none cursor-pointer"
+              />
+            </div>
+
+            <div class="space-y-3">
+              <div class="flex justify-between items-center">
+                <label
+                  class="text-[10px] text-slate-500 uppercase font-bold tracking-widest"
+                  >移动止损 (%)</label
+                >
+                <span class="text-xs font-mono text-rose-400"
+                  >{{ stopLoss }}%</span
+                >
+              </div>
+              <input
+                v-model.number="stopLoss"
+                type="range"
+                min="-20"
+                max="-1"
+                step="1"
+                class="w-full accent-rose-500 h-1 bg-slate-800 rounded-lg appearance-none cursor-pointer"
+              />
+            </div>
+
+            <div class="space-y-3">
+              <div class="flex justify-between items-center">
+                <label
+                  class="text-[10px] text-slate-500 uppercase font-bold tracking-widest"
+                  >信号平滑 (天)</label
+                >
+                <span class="text-xs font-mono text-emerald-400"
+                  >{{ gracePeriod }}d</span
+                >
+              </div>
+              <input
+                v-model.number="gracePeriod"
+                type="range"
+                min="1"
+                max="10"
+                step="1"
+                class="w-full accent-emerald-500 h-1 bg-slate-800 rounded-lg appearance-none cursor-pointer"
+              />
+            </div>
+
+            <p class="text-[9px] text-slate-600 leading-relaxed italic">
+              *
+              调整参数后需重新点击回测以生效。较长的预测周期有助于捕捉波段趋势，而较小的止损位能保护本金安全。
+            </p>
+
+            <button
+              @click="runPipeline"
+              :disabled="isLoading"
+              class="w-full mt-4 py-4 px-4 rounded-2xl font-bold transition-all flex items-center justify-center gap-2 group overflow-hidden relative shadow-2xl"
+              :class="
+                isLoading
+                  ? 'bg-slate-800 text-slate-500 cursor-not-allowed'
+                  : 'bg-gradient-to-r from-emerald-600 to-teal-500 text-white hover:scale-[1.02] active:scale-95 shadow-emerald-500/20'
+              "
+            >
+              <div
+                v-if="!isLoading"
+                class="absolute inset-0 bg-white/10 translate-y-full group-hover:translate-y-0 transition-transform duration-300"
+              ></div>
+              <Loader2 v-if="isLoading" class="w-5 h-5 animate-spin" />
+              <Play v-else class="w-5 h-5 fill-current" />
+              {{ isLoading ? "模型计算中..." : "启动波段回测" }}
+            </button>
+          </div>
+        </div>
+
+        <!-- 交易日志区域 -->
+        <div
+          class="glass p-6 rounded-3xl border border-white/5 h-[350px] flex flex-col overflow-hidden relative"
+        >
+          <!-- 加载遮罩 -->
+          <div
+            v-if="isTradesLoading"
+            class="absolute inset-0 z-10 bg-slate-950/50 backdrop-blur-sm rounded-3xl flex items-center justify-center"
+          >
+            <Loader2 class="w-5 h-5 animate-spin text-blue-400" />
+          </div>
+          <h3 class="text-xl font-semibold mb-4 flex items-center gap-2">
+            <List class="w-5 h-5 text-blue-400" /> 交易流水
+            <Loader2
+              v-if="isTradesLoading"
+              class="w-4 h-4 animate-spin text-blue-400"
+            />
+          </h3>
+          <div class="flex-1 overflow-y-auto space-y-3 pr-2 scrollbar-none">
+            <div
+              v-if="trades.length === 0"
+              class="text-slate-600 text-center py-10 text-xs italic"
+            >
+              暂无成交记录
+            </div>
+            <div
+              v-for="t in trades"
+              :key="t.date"
+              class="p-3 bg-white/5 rounded-xl border border-white/5 text-xs flex justify-between items-center"
+            >
+              <div>
+                <div
+                  class="font-bold flex items-center gap-1"
+                  :class="
+                    t.type === 'BUY' ? 'text-emerald-400' : 'text-rose-400'
+                  "
+                >
+                  <span
+                    class="w-1.5 h-1.5 rounded-full"
+                    :class="t.type === 'BUY' ? 'bg-emerald-400' : 'bg-rose-400'"
+                  ></span>
+                  {{ t.type }}
+                </div>
+                <div class="text-[10px] text-slate-500 mt-0.5">
+                  {{ t.date }}
+                </div>
+              </div>
+              <div class="text-right font-mono text-slate-200">
+                ${{ t.price }}
+              </div>
+            </div>
+          </div>
+        </div>
+
+        <!-- 历史回测存档 -->
+        <div
+          class="glass p-6 rounded-3xl border border-white/5 flex-1 flex flex-col overflow-hidden min-h-[350px] relative"
+        >
+          <!-- 加载遮罩 -->
+          <div
+            v-if="isHistoryLoading"
+            class="absolute inset-0 z-10 bg-slate-950/50 backdrop-blur-sm rounded-3xl flex items-center justify-center"
+          >
+            <Loader2 class="w-5 h-5 animate-spin text-amber-400" />
+          </div>
+          <h3 class="text-xl font-semibold mb-4 flex items-center gap-2">
+            <Award class="w-5 h-5 text-amber-400" /> 历史回测存档
+            <Loader2
+              v-if="isHistoryLoading"
+              class="w-4 h-4 animate-spin text-amber-400"
+            />
+          </h3>
+          <div class="flex-1 overflow-y-auto space-y-3 pr-2 scrollbar-none">
+            <div
+              v-if="backtestHistory.length === 0"
+              class="text-slate-600 text-center py-10 text-xs italic"
+            >
+              暂无历史记录
+            </div>
+            <div
+              v-for="h in backtestHistory"
+              :key="h.id"
+              class="p-4 bg-white/5 rounded-2xl border border-white/5 hover:border-amber-500/30 transition-all group flex justify-between items-center cursor-pointer relative"
+              @click="symbol = h.symbol"
+            >
+              <div class="flex flex-col gap-1">
+                <div class="flex items-center gap-2">
+                  <span
+                    class="text-xs font-black text-white px-2 py-0.5 bg-slate-800 rounded border border-white/10 uppercase"
+                    >{{ h.symbol }}</span
+                  >
+                  <span class="text-[10px] text-slate-500 font-mono">{{
+                    h.timestamp
+                  }}</span>
+                </div>
+                <div class="flex gap-3 mt-1">
+                  <span class="text-[10px] uppercase font-bold text-slate-400"
+                    >收益:
+                    <span
+                      :class="
+                        h.metrics.total_return >= 0
+                          ? 'text-emerald-400'
+                          : 'text-rose-400'
+                      "
+                      >{{ h.metrics.total_return }}%</span
+                    ></span
+                  >
+                  <span class="text-[10px] uppercase font-bold text-slate-400"
+                    >夏普:
+                    <span class="text-blue-400">{{
+                      h.metrics.sharpe_ratio
+                    }}</span></span
+                  >
+                </div>
+              </div>
+
+              <button
+                @click="deleteHistory(h.id, $event)"
+                class="opacity-0 group-hover:opacity-100 p-2 hover:bg-rose-500/20 text-rose-500 rounded-lg transition-all"
+              >
+                <Trash2 class="w-4 h-4" />
+              </button>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <!-- 主图表区 -->
+      <div class="lg:col-span-3 space-y-6">
+        <div
+          class="glass p-6 rounded-[2rem] h-[600px] border border-white/5 relative bg-slate-900/40 backdrop-blur-3xl overflow-hidden"
+        >
+          <div class="flex justify-between items-center mb-8 relative z-10">
+            <div>
+              <h3
+                class="text-2xl font-bold tracking-tight mb-1 flex items-center gap-2"
+              >
+                <TrendingUp class="w-6 h-6 text-emerald-400" /> 策略回测报告
+                <Loader2
+                  v-if="isChartDataLoading || isIntradayLoading"
+                  class="w-4 h-4 text-emerald-400 animate-spin"
+                />
+              </h3>
+              <p class="text-slate-500 text-xs font-mono">
+                基于 XGBoost 动态趋势预测模型
+              </p>
+            </div>
+            <div
+              class="flex bg-slate-800/50 p-1 rounded-xl border border-white/5"
+            >
+              <button
+                @click="setChartMode('daily')"
+                :disabled="isChartDataLoading || isIntradayLoading"
+                class="px-4 py-1.5 rounded-lg text-xs font-bold transition-all"
+                :class="[
+                  chartMode === 'daily'
+                    ? 'bg-emerald-500 text-white shadow-lg shadow-emerald-500/20'
+                    : 'text-slate-400 hover:text-white',
+                  isChartDataLoading || isIntradayLoading
+                    ? 'opacity-50 cursor-not-allowed'
+                    : 'cursor-pointer'
+                ]"
+              >
+                日线模式
+              </button>
+              <button
+                @click="setChartMode('intraday')"
+                :disabled="isChartDataLoading || isIntradayLoading"
+                class="px-4 py-1.5 rounded-lg text-xs font-bold transition-all flex items-center gap-2"
+                :class="[
+                  chartMode === 'intraday'
+                    ? 'bg-blue-500 text-white shadow-lg shadow-blue-500/20'
+                    : 'text-slate-400 hover:text-white',
+                  isChartDataLoading || isIntradayLoading
+                    ? 'opacity-50 cursor-not-allowed'
+                    : 'cursor-pointer'
+                ]"
+              >
+                <div
+                  v-if="isIntradayLoading"
+                  class="w-2 h-2 bg-white rounded-full animate-pulse"
+                ></div>
+                分时图
+              </button>
+            </div>
+            <div class="flex gap-2">
+              <div
+                class="px-3 py-1 bg-blue-500/10 border border-blue-500/20 rounded-full text-[10px] text-blue-400 uppercase font-bold tracking-widest"
+              >
+                {{
+                  chartMode === "daily" ? "Historical Model" : "Live Scanner"
+                }}
+              </div>
+            </div>
+          </div>
+
+          <div ref="chartRef" class="w-full h-[500px]"></div>
+
+          <!-- 背景装饰 -->
+          <div
+            class="absolute -top-24 -right-24 w-96 h-96 bg-emerald-500/5 blur-[100px] rounded-full pointer-events-none"
+          ></div>
+          <div
+            class="absolute -bottom-24 -left-24 w-96 h-96 bg-blue-500/5 blur-[100px] rounded-full pointer-events-none"
+          ></div>
+        </div>
+      </div>
+    </div>
+  </div>
+</template>
+
+<style scoped>
+.glass {
+  background: rgba(15, 23, 42, 0.4);
+  backdrop-filter: blur(20px);
+  -webkit-backdrop-filter: blur(20px);
+  box-shadow: 0 8px 32px 0 rgba(0, 0, 0, 0.3);
+}
+
+.scrollbar-none::-webkit-scrollbar {
+  display: none;
+}
+.scrollbar-none {
+  -ms-overflow-style: none;
+  scrollbar-width: none;
+}
+</style>

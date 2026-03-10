@@ -1,0 +1,32 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+venv/
+.venv/
+.env
+
+# Data and Models
+*.csv
+*.joblib
+*.db
+*.log
+*.json
+!package.json
+!tsconfig*.json
+!frontend/package.json
+!frontend/tsconfig*.json
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Frontend
+frontend/node_modules/
+frontend/dist/
+frontend/.env
+frontend/.vscode/
+
+# IDE
+.vscode/
+.idea/

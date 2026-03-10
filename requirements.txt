@@ -1,0 +1,27 @@
+# 基础数据处理
+pandas
+numpy
+yfinance
+pandas_ta
+akshare
+
+# AI 与机器学习
+xgboost
+scikit-learn
+joblib
+
+# 可视化与 UI
+matplotlib
+seaborn
+
+# 后端框架与数据库
+fastapi
+uvicorn
+sqlalchemy
+python-multipart
+
+# 身份验证 (保持 bcrypt 版本兼容性)
+passlib[bcrypt]
+bcrypt==3.1.7 
+python-jose[cryptography]
+python-dotenv
