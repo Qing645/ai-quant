@@ -89,6 +89,20 @@ class Watchlist(Base):
     # 每个用户对同一只股票只能添加一次
     __table_args__ = (Index('ix_user_symbol', 'user_id', 'symbol', unique=True),)
 
+class StockMetadata(Base):
+    """股票/基金元数据缓存表"""
+    __tablename__ = "stock_metadata"
+    
+    id = Column(Integer, primary_key=True, index=True)
+    symbol = Column(String(20), unique=True, index=True)
+    name = Column(String(100))
+    sector = Column(String(100))
+    industry = Column(String(100))
+    currency = Column(String(20))
+    exchange = Column(String(50))
+    summary = Column(Text)
+    updated_at = Column(DateTime, default=datetime.now, onupdate=datetime.now)
+
 # 初始化数据库
 def init_db():
     Base.metadata.create_all(bind=engine)

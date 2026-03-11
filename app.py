@@ -1,10 +1,12 @@
-from fastapi import FastAPI, HTTPException, Query, Depends
+from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect, Depends, Query
 from fastapi.middleware.cors import CORSMiddleware
 from sqlalchemy.exc import IntegrityError
 import pandas as pd
 import os
 import json
-from typing import Optional
+import numpy as np
+import asyncio
+from typing import List, Dict, Optional
 from datetime import datetime
 import database
 from database import SessionLocal, BacktestRun, TradeLog, Watchlist, init_db
@@ -38,6 +40,13 @@ BACKTEST_FILE = "backtest_data.csv"
 MODEL_FILE = "quant_model.joblib"
 METRICS_FILE = "metrics.json"
 TRADES_FILE = "trades.json"
+
+# --- 全局状态缓存 (用于实时信号翻转告警与性能优化) ---
+LAST_SIGNALS = {} # {symbol: last_signal_int}
+MODEL_CACHE = None
+DATA_CACHE = None
+CACHE_TIMESTAMP = 0
+CACHE_EXPIRE = 120 # 数据缓存 2 分钟 (对于 30 秒轮询足够)
 
 @app.get("/api/health")
 def health_check():
@@ -127,48 +136,106 @@ async def run_pipeline(
     symbol: str = "AAPL", 
     start: str = "2020-01-01", 
     end: str = "2024-01-01",
+    initial_capital: float = 10000.0,
     prediction_days: int = 10,
     stop_loss: float = -0.05,
     grace_period: int = 3,
+    pos_ratio: float = 1.0,
+    max_account_drawdown: float = 0.2,
+    use_atr_stop: bool = False,
     current_user: database.User = Depends(get_current_user),
     db: Session = Depends(database.get_db)
 ):
     """
-    一键运行完整量化管线
+    一键运行完整量化管线 (支持逗号分隔的多个标的批量处理)
     """
     try:
+        # 清理旧的组合数据
+        if os.path.exists("portfolio_nav.csv"):
+            os.remove("portfolio_nav.csv")
+            
+        # 支持批量处理
+        symbols = [s.strip().upper() for s in symbol.split(",")]
+        success_list = []
+        symbol_data_map = {} # 用于存储多标的数据路径映射
+        
         # 标准化日期格式
         start = start.replace("/", "-")
         end = end.replace("/", "-")
         
-        # 修正 yfinance 排他性：将 end 日期加 1 天以包含 endDate 当天的数据
+        # 修正 yfinance 排他性
         from datetime import datetime, timedelta
         end_dt = datetime.strptime(end, "%Y-%m-%d")
         fetch_end = (end_dt + timedelta(days=1)).strftime("%Y-%m-%d")
         
-        # 1. 下载数据
-        data_fetcher.fetch_data(symbol, start, fetch_end, DATA_FILE)
-        
-        # 2. 特征工程 (传入动态预测窗口)
-        raw_df = pd.read_csv(DATA_FILE)
-        processed_df = feature_engineer.prepare_features(raw_df, prediction_window=prediction_days)
-        processed_df.to_csv(PROCESSED_FILE, index=False)
-        
-        # 3. 模型训练
-        model_trainer.train_model(PROCESSED_FILE, MODEL_FILE)
-        
-        # 4. 专业回测 (传入止损和宽限期与用户ID)
-        backtest_engine.run_backtest(
-            BACKTEST_FILE, 
-            METRICS_FILE, 
-            TRADES_FILE,
-            stop_loss=stop_loss,
-            grace_period=grace_period,
-            symbol=symbol,
-            user_id=current_user.id
-        )
-        
-        return {"message": "Pipeline completed successfully", "symbol": symbol}
+        for s in symbols:
+            print(f"\n>>>> 正在为 {s} 启动量化管线分步任务...")
+            # 为不同标的分离文件路径，防止覆盖
+            s_data_file = f"data_{s}.csv"
+            s_processed_file = f"processed_{s}.csv"
+            s_model_file = f"model_{s}.joblib"
+            s_backtest_file = f"backtest_{s}.csv"
+            
+            # 1. 下载数据
+            data_fetcher.fetch_data(s, start, fetch_end, s_data_file)
+            
+            # 2. 特征工程
+            raw_df = pd.read_csv(s_data_file)
+            processed_df = feature_engineer.prepare_features(raw_df, prediction_window=prediction_days)
+            processed_df.to_csv(s_processed_file, index=False)
+            
+            # 3. 模型训练
+            model_trainer.train_model(s_processed_file, s_model_file, s_backtest_file)
+            
+            symbol_data_map[s] = s_backtest_file
+            success_list.append(s)
+            
+        # 兼容单标的模式的旧缓存路径逻辑
+        if len(symbols) == 1:
+            import shutil
+            s = symbols[0]
+            shutil.copy(f"backtest_{s}.csv", BACKTEST_FILE)
+            shutil.copy(f"model_{s}.joblib", MODEL_FILE)
+            global MODEL_CACHE, DATA_CACHE
+            MODEL_CACHE = None
+            DATA_CACHE = None
+            
+        # 4. 执行回测 (单标的 vs 组合模式)
+        if len(symbols) == 1:
+            s = symbols[0]
+            backtest_engine.run_backtest(
+                symbol_data_map[s], 
+                METRICS_FILE, 
+                TRADES_FILE,
+                initial_capital=initial_capital,
+                stop_loss=stop_loss,
+                grace_period=grace_period,
+                pos_ratio=pos_ratio,
+                max_account_drawdown=max_account_drawdown,
+                use_atr_stop=use_atr_stop,
+                symbol=s,
+                user_id=current_user.id
+            )
+        else:
+            print(f"\n>>>> 启动组合回测模式: {symbols}")
+            backtest_engine.run_portfolio_backtest(
+                symbol_data_map,
+                METRICS_FILE,
+                TRADES_FILE,
+                initial_capital=initial_capital,
+                stop_loss=stop_loss,
+                grace_period=grace_period,
+                pos_ratio=pos_ratio,
+                max_account_drawdown=max_account_drawdown,
+                use_atr_stop=use_atr_stop,
+                user_id=current_user.id
+            )
+            
+        return {
+            "message": "Portfolio pipeline completed" if len(symbols) > 1 else "Single pipeline completed", 
+            "symbols": success_list,
+            "mode": "portfolio" if len(symbols) > 1 else "single"
+        }
     except Exception as e:
         import traceback
         error_detail = str(e)
@@ -178,19 +245,21 @@ async def run_pipeline(
 @app.get("/api/data/chart")
 def get_chart_data():
     """
-    获取图表展示数据
+    获取图表展示数据 (支持单标的 K 线与组合 NAV 曲线)
     """
     from fastapi.responses import Response
     import math
     
-    if not os.path.exists(BACKTEST_FILE):
+    # 优先检查是否存在组合回测数据
+    target_file = "portfolio_nav.csv" if os.path.exists("portfolio_nav.csv") else BACKTEST_FILE
+    
+    if not os.path.exists(target_file):
         raise HTTPException(status_code=404, detail="Backtest data not found.")
     
-    df = pd.read_csv(BACKTEST_FILE)
-    # 替换 Inf/-Inf 为 NaN，然后清洗为 None
+    df = pd.read_csv(target_file)
+    # 替换 Inf/-Inf 为 NaN
     df = df.replace([float('inf'), float('-inf')], float('nan'))
     
-    # 手动将每行数据转成 Python 原生类型，避免 numpy float64 导致序列化失败
     records = []
     for row in df.to_dict(orient="records"):
         clean = {}
@@ -222,13 +291,46 @@ def get_model_metrics():
 
 @app.get("/api/data/intraday")
 async def get_intraday_data(symbol: str):
-    """获取标的分时数据，并附加昨收价信息"""
+    """获取标的分时数据，并附加实时最新价格对齐 (Live Tick-to-Min)"""
     try:
         data = data_fetcher.fetch_intraday_data(symbol)
         quote = data_fetcher.fetch_realtime_quote(symbol)
-        prev_close = quote.get('prev_close', 0) if quote else 0
-        return {"data": data, "prev_close": prev_close}
+        
+        if not quote:
+            return {"data": data, "prev_close": 0}
+            
+        # 实时补点逻辑：将“实时秒级行情”合并入“分钟历史序列”
+        # 优先使用行情自带的时间戳，如果缺失则回退到系统时间 (HH:MM)
+        from datetime import datetime
+        now_time = quote.get('time') or datetime.now().strftime("%H:%M")
+        
+        # 确保时间格式为 HH:MM (处理 15:00:11 -> 15:00)
+        if len(now_time) > 5:
+            now_time = now_time[:5]
+            
+        if data:
+            last_point = data[-1]
+            if last_point['time'] == now_time:
+                # 如果当前分钟已在序列中，更新为最新成交价
+                last_point['price'] = quote['close']
+            else:
+                # 手动追加一个实时点
+                data.append({
+                    'time': now_time,
+                    'price': quote['close'],
+                    'volume': 0 
+                })
+        else:
+            # 如果序列为空，直接加入一个实时点
+            data = [{
+                'time': now_time,
+                'price': quote['close'],
+                'volume': 0
+            }]
+            
+        return {"data": data, "prev_close": quote.get('prev_close', 0)}
     except Exception as e:
+        print(f"分时数据对齐失败: {e}")
         raise HTTPException(status_code=500, detail=str(e))
 
 @app.get("/api/backtest/trades")
@@ -300,59 +402,94 @@ async def check_realtime_signal(symbol: str = "159915.SZ"):
     """
     实时扫描：结合历史数据与即时价格，给出此时此刻的 AI 诊断
     """
+    global MODEL_CACHE, DATA_CACHE, CACHE_TIMESTAMP
     import joblib
     import numpy as np
+    import time
     
-    if not os.path.exists(MODEL_FILE) or not os.path.exists(DATA_FILE):
-        return {"status": "error", "message": "模型或历史数据未就绪，请先运行回测。"}
-        
+    # 1. 模型缓存检查 (单例模式)
+    if MODEL_CACHE is None:
+        if os.path.exists(MODEL_FILE):
+            print(f"  [Perf] 正在初始加载 AI 模型至内存...")
+            MODEL_CACHE = joblib.load(MODEL_FILE)
+        else:
+            return {"status": "error", "message": "模型未就绪，请先运行回测训练。"}
+            
     try:
-        # 1. 获取实时行情
+        # 2. 获取实时行情 (这是目前最耗时的 IO 步骤)
         quote = data_fetcher.fetch_realtime_quote(symbol)
         if not quote:
             return {"status": "error", "message": "无法获取实时行情"}
             
-        # 2. 读取最近的历史数据 (至少需要 60 天来计算特征)
-        hist_df = pd.read_csv(DATA_FILE)
+        # 3. 历史数据缓存检查
+        now = time.time()
+        if DATA_CACHE is None or (now - CACHE_TIMESTAMP > CACHE_EXPIRE):
+            if os.path.exists(BACKTEST_FILE):
+                print(f"  [Perf] 正在刷新历史行情缓存 (Source: {BACKTEST_FILE})...")
+                DATA_CACHE = pd.read_csv(BACKTEST_FILE)
+                CACHE_TIMESTAMP = now
+            else:
+                return {"status": "error", "message": "回测数据缺失，请先运行回测管线。"}
         
-        # 3. 将实时点拼接到历史数据末端
-        # 如果实时点日期与历史最后一天相同，则替换最后一天，否则追加
+        hist_df = DATA_CACHE.copy()
+        
+        # 4. 实时点热更新
         if hist_df.iloc[-1]['date'] == quote['date']:
-            hist_df.iloc[-1, hist_df.columns.get_loc('close')] = quote['close']
-            hist_df.iloc[-1, hist_df.columns.get_loc('high')] = max(hist_df.iloc[-1]['high'], quote['high'])
-            hist_df.iloc[-1, hist_df.columns.get_loc('low')] = min(hist_df.iloc[-1]['low'], quote['low'])
-            hist_df.iloc[-1, hist_df.columns.get_loc('volume')] = quote['volume']
+            for col in ['close', 'high', 'low', 'volume']:
+                if col in hist_df.columns:
+                    if col == 'high':
+                        hist_df.iloc[-1, hist_df.columns.get_loc(col)] = max(hist_df.iloc[-1]['high'], quote['high'])
+                    elif col == 'low':
+                        hist_df.iloc[-1, hist_df.columns.get_loc(col)] = min(hist_df.iloc[-1]['low'], quote['low'])
+                    else:
+                        hist_df.iloc[-1, hist_df.columns.get_loc(col)] = quote[col]
         else:
             new_row = pd.DataFrame([quote])
             hist_df = pd.concat([hist_df, new_row], ignore_index=True)
             
-        # 4. 重新计算特征 (实时行情下，特征会受到最新价格博弈影响)
-        processed_df = feature_engineer.prepare_features(hist_df.copy())
+        # 5. 增量特征计算优化
+        subset_df = hist_df.tail(100).copy()
+        processed_df = feature_engineer.prepare_features(subset_df)
         
-        # 5. 加载模型并推理
-        model = joblib.load(MODEL_FILE)
+        # 6. 使用缓存的模型推理
+        model = MODEL_CACHE
         feature_cols = [
-            'rsi', 'macd', 'macd_signal', 'sma_20_dist', 'sma_50_dist', 'bb_width', 'bb_p',
-            'vol_ratio', 'obv_roc', 'atr_ratio', 'roc', 'ema_dev', 'vpt_roc'
+            'rsi', 'macd', 'macd_signal', 'sma_20_dist', 'volatility', 
+            'body_size', 'upper_shadow', 'vol_ratio', 'bb_p', 'roc',
+            'obv_roc', 'vpt_roc'
         ]
         
-        # 检查特征是否对齐
+        missing = [c for c in feature_cols if c not in processed_df.columns]
+        if missing:
+            processed_df = feature_engineer.prepare_features(hist_df.copy())
+            
         X_latest = processed_df[feature_cols].tail(1)
-        prob = model.predict_proba(X_latest)[:, 1][0]
         
-        # 获取阈值参考 (取最后 60 天预测概率的 80 分位作为动态基准)
-        full_probs = model.predict_proba(processed_df[feature_cols])[:, 1]
-        threshold = np.percentile(full_probs[-60:], 80)
-        if threshold < 0.35: threshold = 0.35
-        
+        if isinstance(model, list):
+            probs = [m.predict_proba(X_latest)[0, 1] for m in model]
+            prob = float(np.mean(probs))
+            print(f"  [Ensemble] 实时诊断共识度: {prob:.4f} | 专家子集: {[round(p, 2) for p in probs]}")
+        else:
+            prob = float(model.predict_proba(X_latest)[0, 1])
+
+        # 动态判定
+        threshold = 0.5
         signal = 1 if prob >= threshold else 0
+        
+        # 实时翻转告警
+        if symbol in LAST_SIGNALS and LAST_SIGNALS[symbol] != signal:
+            emoji = "🚀" if signal == 1 else "⚠️"
+            msg = "买点出现：AI 检测到多头动能爆发！" if signal == 1 else "趋势见顶：建议分开止盈防范回撤。"
+            print(f"\n{emoji} 【AI 信号翻转告警】 {symbol} | {msg} (自信度: {prob:.2f})")
+            
+        LAST_SIGNALS[symbol] = signal
         
         return {
             "status": "success",
             "symbol": symbol,
-            "current_price": round(quote['close'], 3),
+            "current_price": round(float(quote['close']), 3),
             "change_pct": round(((quote['close'] - quote.get('prev_close', quote['open'])) / quote.get('prev_close', quote['open'])) * 100, 2) if quote.get('prev_close', quote['open']) != 0 else 0,
-            "prev_close": round(quote.get('prev_close', quote['open']), 3),
+            "prev_close": round(float(quote.get('prev_close', quote['open'])), 3),
             "ai_confidence": round(float(prob), 4),
             "threshold_ref": round(float(threshold), 4),
             "signal": signal,
@@ -364,10 +501,26 @@ async def check_realtime_signal(symbol: str = "159915.SZ"):
         return {"status": "error", "message": f"实时诊断失败: {str(e)}"}
 
 @app.get("/api/stock/info")
-def get_stock_info(symbol: str):
+def get_stock_info(symbol: str, db: Session = Depends(database.get_db)):
     """
-    获取股票元数据并自动翻译业务摘要
+    获取股票元数据并自动翻译业务摘要 (带数据库缓存)
     """
+    symbol = symbol.strip().upper()
+    
+    # 1. 优先尝试从数据库读取缓存
+    cached = db.query(database.StockMetadata).filter(database.StockMetadata.symbol == symbol).first()
+    if cached:
+        # 简单逻辑：7天内不重复刷数据 (可选)
+        return {
+            "name": cached.name,
+            "sector": cached.sector,
+            "industry": cached.industry,
+            "currency": cached.currency,
+            "exchange": cached.exchange,
+            "summary": cached.summary,
+            "from_cache": True
+        }
+
     # 常用板块和行业翻译映射
     TRANSLATIONS = {
         "Technology": "信息技术",
@@ -444,24 +597,36 @@ def get_stock_info(symbol: str):
                         pass
                 if found_name:
                     name = found_name
-                elif any(ord(c) < 128 for c in str(raw_name)):
-                    # 退回翻译逻辑
-                    name = _translate_to_chinese(raw_name)
-        else:
-            has_english = any(ord(c) < 128 for c in str(raw_name))
-            if is_a_share and has_english:  # fail-safe
-                name = _translate_to_chinese(raw_name)
-
+        
         currency = info.get("currency", "USD")
         if currency == "CNY": currency = "人民币 (CNY)"
-        
+        exchange = info.get("exchange", "未知交易所")
+
+        # 2. 写入/更新缓存
+        try:
+            new_meta = database.StockMetadata(
+                symbol=symbol,
+                name=name,
+                sector=sector,
+                industry=industry,
+                currency=currency,
+                exchange=exchange,
+                summary=summary
+            )
+            db.merge(new_meta)
+            db.commit()
+        except Exception as db_err:
+            print(f"缓存写入失败: {db_err}")
+            db.rollback()
+
         return {
             "name": name,
             "sector": sector,
             "industry": industry,
             "currency": currency,
-            "exchange": info.get("exchange", "未知交易所"),
-            "summary": summary
+            "exchange": exchange,
+            "summary": summary,
+            "from_cache": False
         }
     except Exception as e:
         print(f"获取股票信息失败: {e}")
@@ -512,17 +677,33 @@ async def delete_backtest_run(run_id: int, current_user: database.User = Depends
 
 @app.get("/api/watchlist")
 async def get_watchlist(current_user: database.User = Depends(get_current_user), db: Session = Depends(database.get_db)):
-    """获取所有自选股"""
-    items = db.query(Watchlist).filter(Watchlist.user_id == current_user.id).all()
-    return [{"symbol": item.symbol, "added_at": item.added_at} for item in items]
+    """获取所有自选股 (包含中文名称)"""
+    from database import StockMetadata
+    
+    # 使用 outerjoin 关联元数据缓存表
+    results = db.query(database.Watchlist, StockMetadata.name).\
+        outerjoin(StockMetadata, database.Watchlist.symbol == StockMetadata.symbol).\
+        filter(database.Watchlist.user_id == current_user.id).all()
+        
+    return [
+        {
+            "symbol": item.symbol, 
+            "name": name or item.symbol, 
+            "added_at": item.added_at
+        } for item, name in results
+    ]
 
 @app.post("/api/watchlist")
 async def add_to_watchlist(symbol: str, current_user: database.User = Depends(get_current_user), db: Session = Depends(database.get_db)):
     """添加股票到自选"""
-    symbol = symbol.upper()
+    from sqlalchemy import func
+    symbol = symbol.strip().upper()
     try:
-        # 检查是否已存在
-        existing = db.query(Watchlist).filter(Watchlist.symbol == symbol, Watchlist.user_id == current_user.id).first()
+        # 检查是否已存在 (大小写不敏感检查)
+        existing = db.query(database.Watchlist).filter(
+            func.upper(database.Watchlist.symbol) == symbol, 
+            database.Watchlist.user_id == current_user.id
+        ).first()
         if existing:
             return {"message": "已在自选中"}
         
@@ -536,26 +717,51 @@ async def add_to_watchlist(symbol: str, current_user: database.User = Depends(ge
     except Exception as e:
         db.rollback()
         raise HTTPException(status_code=500, detail=str(e))
-    finally:
-        db.close()
 
-@app.delete("/api/watchlist/{symbol}")
-async def remove_from_watchlist(symbol: str, current_user: database.User = Depends(get_current_user), db: Session = Depends(database.get_db)):
-    """从自选移除股票"""
-    symbol = symbol.upper()
+@app.delete("/api/watchlist")
+async def remove_from_watchlist(symbol: str = Query(...), current_user: database.User = Depends(get_current_user), db: Session = Depends(database.get_db)):
+    """从自选移除股票 (Query参数增强版)"""
+    from sqlalchemy import func
+    original_symbol = symbol
+    clean_symbol = symbol.strip().upper()
+    
     try:
-        item = db.query(Watchlist).filter(Watchlist.symbol == symbol, Watchlist.user_id == current_user.id).first()
+        # 调试日志：确认上下文
+        all_mine = db.query(database.Watchlist).filter(database.Watchlist.user_id == current_user.id).all()
+        log_msg = f"\n[DEBUG] {datetime.now()} | UserID: {current_user.id} | Symbol: '{clean_symbol}' | Mine: {[i.symbol for i in all_mine]}"
+        print(log_msg)
+        with open("/tmp/debug_quant.log", "a") as f:
+            f.write(log_msg + "\n")
+
+        # 1. 尝试精确大写匹配
+        item = db.query(database.Watchlist).filter(
+            func.upper(database.Watchlist.symbol) == clean_symbol, 
+            database.Watchlist.user_id == current_user.id
+        ).first()
+        
+        # 2. 如果没找到，尝试含糊匹配 (处理可能存在的后缀不一，如 159948.sz vs 159948)
         if not item:
-            raise HTTPException(status_code=404, detail="自选中未找到该标或无权操作")
+            search_pattern = clean_symbol.split('.')[0] + "%"
+            print(f"[DEBUG] 精确匹配失败，尝试前缀匹配: {search_pattern}")
+            item = db.query(database.Watchlist).filter(
+                database.Watchlist.symbol.ilike(search_pattern),
+                database.Watchlist.user_id == current_user.id
+            ).first()
+
+        if not item:
+            print(f"[DEBUG] 最终仍未找到匹配项。")
+            raise HTTPException(status_code=404, detail=f"自选中未找到标的 {clean_symbol} 或无权操作")
         
         db.delete(item)
         db.commit()
+        print(f"[DEBUG] 成功移除: {item.symbol}")
         return {"message": "移除成功"}
+    except HTTPException as he:
+        raise he
     except Exception as e:
         db.rollback()
+        print(f"[DEBUG] 移除异常: {str(e)}")
         raise HTTPException(status_code=500, detail=str(e))
-    finally:
-        pass
 
 if __name__ == "__main__":
     import uvicorn

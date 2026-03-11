@@ -13,7 +13,8 @@ import {
   Award,
   ShieldAlert,
   Trash2,
-  Star
+  Star,
+  Info,
 } from "lucide-vue-next";
 
 const chartRef = ref<HTMLElement | null>(null);
@@ -29,7 +30,7 @@ const metrics = ref({
   win_rate: 0,
   profit_loss_ratio: 0,
   trade_count: 0,
-  final_value: 0
+  final_value: 0,
 });
 const trades = ref<any[]>([]);
 const stockInfo = ref({
@@ -38,12 +39,16 @@ const stockInfo = ref({
   industry: "",
   currency: "",
   exchange: "",
-  summary: ""
+  summary: "",
 });
 const statusMsg = ref("就绪");
+const initialCapital = ref(10000); // 初始本金
 const predictionDays = ref(30);
 const stopLoss = ref(-10); // 百分比显示，发送时除以 100
 const gracePeriod = ref(3);
+const posRatio = ref(1.0); // 仓位比例 0.1-1.0
+const maxAccountDrawdown = ref(25); // 账户熔断阈值 %
+const useAtrStop = ref(true); // 是否使用 ATR 动态止损
 const lastSignal = ref({ date: "N/A", signal: 0, price: 0, status: "loading" });
 const realtimeSignal = ref<any>(null);
 const backtestHistory = ref<any[]>([]);
@@ -65,7 +70,7 @@ const fetchWithAuth = async (url: string, options: RequestInit = {}) => {
   const token = localStorage.getItem("token");
   const headers = {
     ...options.headers,
-    Authorization: token ? `Bearer ${token}` : ""
+    Authorization: token ? `Bearer ${token}` : "",
   };
 
   const res = await fetch(url, { ...options, headers });
@@ -91,13 +96,17 @@ const runPipeline = async () => {
       symbol: symbol.value,
       start: startDate.value,
       end: endDate.value,
+      initial_capital: initialCapital.value.toString(),
       prediction_days: predictionDays.value.toString(),
       stop_loss: (stopLoss.value / 100).toString(),
-      grace_period: gracePeriod.value.toString()
+      grace_period: gracePeriod.value.toString(),
+      pos_ratio: posRatio.value.toString(),
+      max_account_drawdown: (maxAccountDrawdown.value / 100).toString(),
+      use_atr_stop: useAtrStop.value.toString(),
     });
 
     const res = await fetchWithAuth(`/api/run-pipeline?${params.toString()}`, {
-      method: "POST"
+      method: "POST",
     });
     if (!res.ok) {
       const errorData = await res.json();
@@ -110,7 +119,7 @@ const runPipeline = async () => {
       fetchMetrics(),
       fetchTrades(),
       fetchLastSignal(),
-      fetchHistory()
+      fetchHistory(),
     ]);
     startRealtimeMonitor();
     statusMsg.value = "已更新";
@@ -118,7 +127,7 @@ const runPipeline = async () => {
     console.error("Pipeline failed:", err);
     statusMsg.value = `错误: ${err.message}`;
     alert(
-      `回测失败: ${err.message}\n提示: 如果样本量过少，请尝试扩大日期范围。`
+      `回测失败: ${err.message}\n提示: 如果样本量过少，请尝试扩大日期范围。`,
     );
   } finally {
     isLoading.value = false;
@@ -127,13 +136,10 @@ const runPipeline = async () => {
 
 const fetchStockInfo = async () => {
   try {
-    isStockInfoLoading.value = true;
     const res = await fetchWithAuth(`/api/stock/info?symbol=${symbol.value}`);
     stockInfo.value = await res.json();
   } catch (err) {
     console.error("获取股票信息失败", err);
-  } finally {
-    isStockInfoLoading.value = false;
   }
 };
 
@@ -154,7 +160,7 @@ const fetchIntradayData = async () => {
   try {
     isIntradayLoading.value = true;
     const res = await fetchWithAuth(
-      `/api/data/intraday?symbol=${symbol.value}`
+      `/api/data/intraday?symbol=${symbol.value}`,
     );
     const resData = await res.json();
     if (resData && Array.isArray(resData.data)) {
@@ -241,7 +247,7 @@ const fetchRealtimeCheck = async () => {
 
   try {
     const res = await fetchWithAuth(
-      `/api/realtime/check?symbol=${symbol.value}`
+      `/api/realtime/check?symbol=${symbol.value}`,
     );
     const data = await res.json();
     if (data.status === "success") {
@@ -249,9 +255,17 @@ const fetchRealtimeCheck = async () => {
       // 如果在分时模式，自动刷新分时数据
       if (chartMode.value === "intraday") {
         const iRes = await fetchWithAuth(
-          `/api/data/intraday?symbol=${symbol.value}`
+          `/api/data/intraday?symbol=${symbol.value}`,
         );
-        intradayData.value = await iRes.json();
+        const resData = await iRes.json();
+        if (resData && Array.isArray(resData.data)) {
+          intradayData.value = resData.data;
+          if (resData.prev_close) {
+            (intradayData.value as any).prev_close = resData.prev_close;
+          }
+        } else {
+          intradayData.value = resData;
+        }
         renderChart(intradayData.value);
       }
     }
@@ -291,19 +305,19 @@ const toggleWatchlistBySymbol = async (targetSymbol: string) => {
   if (isWatchlistLoading.value) return;
   const upperSymbol = targetSymbol.toUpperCase();
   const isFavorite = watchlist.value.some(
-    (w) => w.symbol.toUpperCase() === upperSymbol
+    (w) => w.symbol.toUpperCase() === upperSymbol,
   );
   try {
     isWatchlistLoading.value = true;
     statusMsg.value = isFavorite ? "正在取消收藏..." : "正在加入自选...";
     if (isFavorite) {
-      await fetchWithAuth(`/api/watchlist/${upperSymbol}`, {
-        method: "DELETE"
+      await fetchWithAuth(`/api/watchlist?symbol=${upperSymbol}`, {
+        method: "DELETE",
       });
       statusMsg.value = "已从自选移除";
     } else {
       await fetchWithAuth(`/api/watchlist?symbol=${upperSymbol}`, {
-        method: "POST"
+        method: "POST",
       });
       statusMsg.value = "已加入自选";
     }
@@ -321,7 +335,7 @@ const deleteHistory = async (id: number, e: Event) => {
   if (!confirm("确定要删除这条历史记录吗？")) return;
   try {
     const res = await fetchWithAuth(`/api/backtest/history/${id}`, {
-      method: "DELETE"
+      method: "DELETE",
     });
     if (res.ok) {
       await fetchHistory();
@@ -331,12 +345,49 @@ const deleteHistory = async (id: number, e: Event) => {
   }
 };
 
+const generateIntradayTimes = () => {
+  const times = [];
+  // 早上 09:30 - 11:30
+  for (let h = 9; h <= 11; h++) {
+    for (let m = 0; m < 60; m++) {
+      if (h === 9 && m < 30) continue;
+      if (h === 11 && m > 30) continue;
+      times.push(
+        `${h.toString().padStart(2, "0")}:${m.toString().padStart(2, "0")}`,
+      );
+    }
+  }
+  // 下午 13:00 - 15:00
+  for (let h = 13; h <= 15; h++) {
+    for (let m = 0; m < 60; m++) {
+      if (h === 15 && m > 0) continue;
+      times.push(
+        `${h.toString().padStart(2, "0")}:${m.toString().padStart(2, "0")}`,
+      );
+    }
+  }
+  return times;
+};
+
 const renderChart = (data: any[]) => {
   if (!chartRef.value) return;
   if (!myChart) myChart = echarts.init(chartRef.value);
 
   const isDaily = chartMode.value === "daily";
-  const dates = data.map((d) => (isDaily ? d.date : d.time));
+
+  // 判断是否处于交易时间内 (中国 A 股标准，留出 5 分钟数据同步缓冲)
+  const isTrading = (() => {
+    const now = new Date();
+    const day = now.getDay();
+    if (day === 0 || day === 6) return false;
+    const timeNum = now.getHours() * 100 + now.getMinutes();
+    return (
+      (timeNum >= 930 && timeNum <= 1135) ||
+      (timeNum >= 1300 && timeNum <= 1505)
+    );
+  })();
+
+  let dates = data.map((d) => (isDaily ? d.date : d.time));
 
   // 处理序列数据
   const kData = isDaily
@@ -344,25 +395,67 @@ const renderChart = (data: any[]) => {
         parseFloat(d.open),
         parseFloat(d.close),
         parseFloat(d.low),
-        parseFloat(d.high)
+        parseFloat(d.high),
       ])
     : [];
 
-  const lineData = isDaily ? [] : data.map((d) => parseFloat(d.price));
+  let lineData = isDaily ? [] : data.map((d) => parseFloat(d.price));
 
-  const volumes = data.map((d, i) => ({
+  let volumes = data.map((d, i) => ({
     value: parseFloat(d.volume),
     itemStyle: {
-      color: isDaily ? (d.close >= d.open ? "#ef4444" : "#10b981") : "#3b82f6" // 分时颜色统一蓝色或根据涨跌
-    }
+      color: isDaily ? (d.close >= d.open ? "#ef4444" : "#10b981") : "#3b82f6",
+    },
   }));
 
+  // 分时图全时间轴补全逻辑 (09:30 - 15:00)
+  if (!isDaily) {
+    const fullTimes = generateIntradayTimes();
+    const dataMap = new Map();
+    data.forEach((d) => dataMap.set(d.time, d));
+
+    dates = fullTimes;
+    const newLineData: any[] = [];
+    const newVolumes: any[] = [];
+
+    fullTimes.forEach((t, i) => {
+      const d = dataMap.get(t);
+      if (d) {
+        newLineData.push(parseFloat(d.price));
+        newVolumes.push({
+          value: parseFloat(d.volume),
+          itemStyle: {
+            color:
+              i === 0 ||
+              parseFloat(d.price) >= (newLineData[i - 1] ?? parseFloat(d.price))
+                ? "#ef4444"
+                : "#10b981",
+          },
+        });
+      } else {
+        newLineData.push(null);
+        newVolumes.push({
+          value: null,
+          itemStyle: { color: "transparent" },
+        });
+      }
+    });
+
+    lineData = newLineData;
+    volumes = newVolumes;
+  }
+
+  const isPortfolioMode =
+    data.length > 0 && !data[0].open && data[0].portfolio_value !== undefined;
+
   const portfolio = isDaily ? data.map((d) => d.portfolio_value) : [];
-  const ma20 = isDaily ? data.map((d) => d.sma_20 || null) : [];
-  const ma50 = isDaily ? data.map((d) => d.sma_50 || null) : [];
+  const ma20 =
+    isDaily && !isPortfolioMode ? data.map((d) => d.sma_20 || null) : [];
+  const ma50 =
+    isDaily && !isPortfolioMode ? data.map((d) => d.sma_50 || null) : [];
 
   const markPoints: any[] = [];
-  if (isDaily) {
+  if (isDaily && !isPortfolioMode) {
     data.forEach((d, i) => {
       const prevSignal = i > 0 ? data[i - 1].predicted_signal : 0;
       if (d.predicted_signal === 1 && prevSignal === 0) {
@@ -371,7 +464,7 @@ const renderChart = (data: any[]) => {
           value: "B",
           xAxis: i,
           yAxis: d.low,
-          itemStyle: { color: "#10b981" }
+          itemStyle: { color: "#10b981" },
         });
       } else if (d.predicted_signal === 0 && prevSignal === 1) {
         markPoints.push({
@@ -379,7 +472,7 @@ const renderChart = (data: any[]) => {
           value: "S",
           xAxis: i,
           yAxis: d.high,
-          itemStyle: { color: "#ef4444" }
+          itemStyle: { color: "#ef4444" },
         });
       }
     });
@@ -396,19 +489,33 @@ const renderChart = (data: any[]) => {
       formatter: function (params: any) {
         let res = `<div style="font-weight:bold;margin-bottom:4px;border-bottom:1px solid #334155;padding-bottom:2px;">${params[0].axisValue}</div>`;
         let dataIndex = params[0].dataIndex;
+
+        // --- 核心修复：如果是分时图补全的空白点，仅显示时间，不显示数值和涨幅 ---
+        if (!isDaily && lineData[dataIndex] === null) {
+          return res;
+        }
+
+        let itemData = data[dataIndex];
+
         let prevClose = isDaily
-          ? dataIndex > 0
+          ? dataIndex > 0 && data[dataIndex - 1]
             ? data[dataIndex - 1].close
-            : data[0].open
-          : (data as any).prev_close
-            ? (data as any).prev_close
-            : realtimeSignal.value && realtimeSignal.value.prev_close
-              ? realtimeSignal.value.prev_close
-              : data[0].price; // 分时图优先取数据内含的昨收，其次取诊断返回的昨收，否则降级取首笔交易价
+            : data[0]
+              ? data[0].open
+              : 0
+          : (data as any).prev_close ||
+            (realtimeSignal.value && realtimeSignal.value.prev_close) ||
+            (data[0] ? data[0].price : 0);
 
         let currentClose = isDaily
-          ? data[dataIndex].close
-          : data[dataIndex].price;
+          ? itemData
+            ? itemData.close
+            : 0
+          : lineData[dataIndex] !== null
+            ? lineData[dataIndex]
+            : itemData
+              ? itemData.price
+              : 0;
 
         // 转为数值类型，防御性处理可能出现的 string 或 undefined
         const pClose = Number(prevClose);
@@ -423,6 +530,7 @@ const renderChart = (data: any[]) => {
         }
 
         params.forEach((item: any) => {
+          if (item.seriesName === "实时闪烁") return;
           if (item.seriesName === "K线") {
             res += `<div style="font-size: 12px; margin-top: 4px;">`;
             res += `${item.marker} 开盘: <b>${item.data[1]}</b> &nbsp;&nbsp; ${item.marker} 收盘: <b>${item.data[2]}</b><br/>`;
@@ -445,18 +553,18 @@ const renderChart = (data: any[]) => {
           }
         });
         return res;
-      }
+      },
     },
     axisPointer: { link: [{ xAxisIndex: "all" }] },
     legend: {
       show: isDaily,
       textStyle: { color: "#94a3b8" },
       top: 0,
-      data: ["K线", "MA20", "MA50", "成交量", "账户净值"]
+      data: ["K线", "MA20", "MA50", "成交量", "账户净值"],
     },
     grid: [
       { left: "4%", right: "4%", top: "10%", height: isDaily ? "60%" : "70%" },
-      { left: "4%", right: "4%", top: "75%", height: "15%" }
+      { left: "4%", right: "4%", top: "75%", height: "15%" },
     ],
     xAxis: [
       {
@@ -464,7 +572,7 @@ const renderChart = (data: any[]) => {
         data: dates,
         boundaryGap: isDaily,
         axisLine: { lineStyle: { color: "#334155" } },
-        axisLabel: { color: "#64748b" }
+        axisLabel: { color: "#64748b" },
       },
       {
         type: "category",
@@ -472,14 +580,14 @@ const renderChart = (data: any[]) => {
         data: dates,
         boundaryGap: isDaily,
         axisLine: { lineStyle: { color: "#334155" } },
-        axisLabel: { show: false }
-      }
+        axisLabel: { show: false },
+      },
     ],
     yAxis: [
       {
         scale: true,
         splitLine: { lineStyle: { color: "#1e293b" } },
-        axisLabel: { color: "#64748b" }
+        axisLabel: { color: "#64748b" },
       },
       {
         scale: true,
@@ -487,7 +595,7 @@ const renderChart = (data: any[]) => {
         splitNumber: 2,
         axisLabel: { show: false },
         axisLine: { show: false },
-        splitLine: { show: false }
+        splitLine: { show: false },
       },
       {
         type: "value",
@@ -495,29 +603,29 @@ const renderChart = (data: any[]) => {
         name: "净值",
         position: "right",
         splitLine: { show: false },
-        axisLabel: { color: "#10b981" }
-      }
+        axisLabel: { color: "#10b981" },
+      },
     ],
     dataZoom: [
       {
         type: "inside",
         xAxisIndex: [0, 1],
-        start: dates.length > 50 ? 70 : 0,
-        end: 100
+        start: isDaily ? (dates.length > 50 ? 70 : 0) : 0,
+        end: 100,
       },
       {
         type: "slider",
         xAxisIndex: [0, 1],
         bottom: 10,
-        start: dates.length > 50 ? 70 : 0,
+        start: isDaily ? (dates.length > 50 ? 70 : 0) : 0,
         end: 100,
         backgroundColor: "rgba(30, 41, 59, 0.4)",
         fillerColor: "rgba(59, 130, 246, 0.1)",
-        borderColor: "transparent"
-      }
+        borderColor: "transparent",
+      },
     ],
     series: [
-      isDaily
+      isDaily && !isPortfolioMode
         ? {
             name: "K线",
             type: "candlestick",
@@ -526,63 +634,116 @@ const renderChart = (data: any[]) => {
               color: "#ef4444",
               color0: "#10b981",
               borderColor: "#ef4444",
-              borderColor0: "#10b981"
+              borderColor0: "#10b981",
             },
             markPoint: {
               symbol: "pin",
               symbolSize: 30,
               data: markPoints,
-              label: { show: true, fontSize: 10, color: "#fff" }
-            }
+              label: { show: true, fontSize: 10, color: "#fff" },
+            },
           }
-        : {
-            name: "分时",
-            type: "line",
-            data: lineData,
-            smooth: true,
-            symbol: "none",
-            lineStyle: { color: "#3b82f6", width: 2 },
-            areaStyle: {
-              color: new echarts.graphic.LinearGradient(0, 0, 0, 1, [
-                { offset: 0, color: "rgba(59, 130, 246, 0.4)" },
-                { offset: 1, color: "rgba(59, 130, 246, 0)" }
-              ])
+        : !isDaily
+          ? {
+              name: "分时",
+              type: "line",
+              data: lineData,
+              smooth: false,
+              symbol: "none",
+              lineStyle: { color: "#3b82f6", width: 2 },
+              areaStyle: {
+                color: new echarts.graphic.LinearGradient(0, 0, 0, 1, [
+                  { offset: 0, color: "rgba(59, 130, 246, 0.4)" },
+                  { offset: 1, color: "rgba(59, 130, 246, 0)" },
+                ]),
+              },
             }
-          },
+          : { type: "line", data: [] }, // 组合模式下清空 K 线占位
       {
         name: "MA20",
         type: "line",
-        data: ma20,
+        data: isDaily && !isPortfolioMode ? ma20 : [],
         smooth: true,
         lineStyle: { opacity: 0.5, width: 1 },
-        symbol: "none"
+        symbol: "none",
       },
       {
         name: "MA50",
         type: "line",
-        data: ma50,
+        data: isDaily && !isPortfolioMode ? ma50 : [],
         smooth: true,
         lineStyle: { opacity: 0.5, width: 1 },
-        symbol: "none"
+        symbol: "none",
       },
       {
         name: "成交量",
         type: "bar",
         xAxisIndex: 1,
         yAxisIndex: 1,
-        data: volumes
+        data: !isPortfolioMode ? volumes : [],
+        itemStyle: {
+          color: (params: any) => {
+            const idx = params.dataIndex;
+            if (isDaily) {
+              const item = kData[idx];
+              return item && item[1] > item[0] ? "#ef4444" : "#10b981";
+            }
+            // 分时图成交量颜色
+            if (idx === 0) return "#3b82f6";
+            return lineData[idx] >= lineData[idx - 1] ? "#ef4444" : "#10b981";
+          },
+        },
       },
       {
-        name: "账户净值",
+        name: isPortfolioMode ? "组合权益曲线 (NAV)" : "账户净值",
         type: "line",
-        data: portfolio,
-        yAxisIndex: 2,
+        data: isDaily ? portfolio : [],
+        yAxisIndex: isPortfolioMode ? 0 : 2, // 组合模式下直接画在主轴
         smooth: true,
-        symbol: "none",
         itemStyle: { color: "#10b981" },
-        lineStyle: { width: 2 }
-      }
-    ]
+        lineStyle: {
+          width: 3,
+          shadowBlur: 10,
+          shadowColor: "rgba(16, 185, 129, 0.3)",
+        },
+        areaStyle: isPortfolioMode
+          ? {
+              color: new echarts.graphic.LinearGradient(0, 0, 0, 1, [
+                { offset: 0, color: "rgba(16, 185, 129, 0.2)" },
+                { offset: 1, color: "rgba(16, 185, 129, 0)" },
+              ]),
+            }
+          : undefined,
+      },
+      // 实时闪烁点 - 仅在分时图模式且交易时间内显示
+      {
+        name: "实时闪烁",
+        type: "effectScatter",
+        coordinateSystem: "cartesian2d",
+        data:
+          !isDaily && lineData.length > 0 && isTrading
+            ? [
+                [
+                  lineData.findLastIndex((v) => v !== null),
+                  lineData.filter((v) => v !== null).pop(),
+                ],
+              ]
+            : [],
+        symbolSize: 8,
+        showEffectOn: "render",
+        rippleEffect: {
+          brushType: "stroke",
+          scale: 4,
+          period: 4,
+        },
+        itemStyle: {
+          color: "#3b82f6",
+          shadowBlur: 10,
+          shadowColor: "#3b82f6",
+        },
+        zlevel: 1,
+      },
+    ],
   };
   myChart.setOption(option, true);
 };
@@ -624,19 +785,30 @@ onUnmounted(() => {
     </div>
     <!-- 股票概况 Header -->
     <div
-      v-if="stockInfo.name"
+      v-if="stockInfo.name || symbol.includes(',')"
       class="glass p-6 rounded-[2rem] border border-white/10 flex flex-col md:flex-row justify-between items-start md:items-center gap-4 relative overflow-hidden"
     >
-      <div class="relative z-10">
+      <div class="relative z-10 w-full">
         <h1
-          class="text-3xl font-black tracking-tighter text-white flex items-center gap-3"
+          class="text-3xl font-black tracking-tighter text-white flex flex-wrap items-center gap-3"
         >
-          {{ stockInfo.name }}
+          {{ symbol.includes(",") ? "资产组合回测报告" : stockInfo.name }}
           <span
             class="text-sm font-mono px-2 py-0.5 bg-emerald-500/20 text-emerald-400 rounded-md border border-emerald-500/30 uppercase"
             >{{ symbol }}</span
           >
+          <div
+            v-if="symbol.includes(',')"
+            class="flex items-center gap-1.5 px-3 py-1 rounded-full bg-indigo-500/10 border border-indigo-500/20 shadow-lg shadow-indigo-500/10"
+          >
+            <Cpu class="w-3.5 h-3.5 text-indigo-400" />
+            <span
+              class="text-[10px] font-black text-indigo-400 uppercase tracking-widest"
+              >Portfolio Engine v2.0</span
+            >
+          </div>
           <button
+            v-if="!symbol.includes(',')"
             @click="toggleWatchlistBySymbol(symbol)"
             :disabled="isWatchlistLoading"
             class="flex items-center gap-2 px-3 py-1.5 rounded-full border transition-all text-xs font-bold"
@@ -644,13 +816,13 @@ onUnmounted(() => {
               watchlist.some((w) => w.symbol === symbol)
                 ? 'bg-amber-500/20 border-amber-500/50 text-amber-400'
                 : 'bg-white/5 border-white/10 text-slate-400 hover:bg-white/10',
-              isWatchlistLoading ? 'opacity-50 cursor-not-allowed' : ''
+              isWatchlistLoading ? 'opacity-50 cursor-not-allowed' : '',
             ]"
           >
             <Star
               class="w-4 h-4"
               :class="{
-                'fill-current': watchlist.some((w) => w.symbol === symbol)
+                'fill-current': watchlist.some((w) => w.symbol === symbol),
               }"
             />
             {{
@@ -698,7 +870,7 @@ onUnmounted(() => {
           trades[0].type === 'BUY',
         'border-white/10':
           lastSignal.signal === 0 &&
-          (trades.length === 0 || trades[0].type === 'SELL')
+          (trades.length === 0 || trades[0].type === 'SELL'),
       }"
     >
       <div class="flex items-center gap-4 relative z-10">
@@ -713,7 +885,7 @@ onUnmounted(() => {
               trades[0].type === 'BUY',
             'bg-slate-700 text-slate-400':
               lastSignal.signal === 0 &&
-              (trades.length === 0 || trades[0].type === 'SELL')
+              (trades.length === 0 || trades[0].type === 'SELL'),
           }"
         >
           <TrendingUp v-if="lastSignal.signal === 1" class="w-6 h-6" />
@@ -905,7 +1077,16 @@ onUnmounted(() => {
               class="px-3 py-1.5 bg-white/5 hover:bg-amber-500/10 border border-white/5 hover:border-amber-500/30 rounded-full cursor-pointer transition-all group flex items-center gap-2"
               @click="symbol = w.symbol"
             >
-              <span class="text-xs font-mono font-bold">{{ w.symbol }}</span>
+              <span
+                class="text-[10px] font-mono font-bold flex items-center gap-1.5"
+              >
+                {{ w.symbol }}
+                <span
+                  v-if="w.name && w.name !== w.symbol"
+                  class="text-amber-200/60 font-sans font-medium"
+                  >{{ w.name }}</span
+                >
+              </span>
               <button
                 @click.stop="toggleWatchlistBySymbol(w.symbol)"
                 class="opacity-0 group-hover:opacity-100 text-slate-500 hover:text-rose-400 transition-all"
@@ -965,12 +1146,66 @@ onUnmounted(() => {
             <ShieldAlert class="w-5 h-5 text-indigo-400" /> 策略配置
           </h3>
           <div class="space-y-6">
+            <!-- 初始本金 -->
             <div class="space-y-3">
               <div class="flex justify-between items-center">
-                <label
-                  class="text-[10px] text-slate-500 uppercase font-bold tracking-widest"
-                  >预测周期 (天)</label
-                >
+                <div class="flex items-center gap-2 group/tip relative">
+                  <label
+                    class="text-[10px] text-emerald-400 uppercase font-bold tracking-widest cursor-help"
+                    >初始本金 (¥)</label
+                  >
+                  <Info
+                    class="w-3 h-3 text-emerald-400/60 hover:text-emerald-400 transition-colors cursor-help"
+                  />
+                  <!-- Premium Tooltip -->
+                  <div
+                    class="absolute bottom-full left-0 mb-2 w-48 p-2 bg-slate-800 border border-white/10 rounded-xl shadow-2xl opacity-0 invisible group-hover/tip:opacity-100 group-hover/tip:visible transition-all duration-300 z-50 pointer-events-none"
+                  >
+                    <p class="text-[10px] text-slate-300 leading-relaxed">
+                      模拟交易时的投入本金。影响账户净值变化规模与交易数量的计算。
+                    </p>
+                    <div
+                      class="absolute -bottom-1 left-4 w-2 h-2 bg-slate-800 border-r border-b border-white/10 rotate-45"
+                    ></div>
+                  </div>
+                </div>
+                <span class="text-xs font-mono text-emerald-400">{{
+                  initialCapital.toLocaleString()
+                }}</span>
+              </div>
+              <input
+                v-model.number="initialCapital"
+                type="range"
+                min="1000"
+                max="1000000"
+                step="1000"
+                class="w-full h-1.5 bg-slate-700/50 rounded-lg appearance-none cursor-pointer accent-emerald-500 hover:accent-emerald-400 transition-all"
+              />
+            </div>
+
+            <div class="space-y-3">
+              <div class="flex justify-between items-center">
+                <div class="flex items-center gap-2 group/tip relative">
+                  <label
+                    class="text-[10px] text-slate-500 uppercase font-bold tracking-widest cursor-help"
+                    >预测周期 (天)</label
+                  >
+                  <Info
+                    class="w-3 h-3 text-slate-600 hover:text-indigo-400 transition-colors cursor-help"
+                  />
+                  <!-- Premium Tooltip -->
+                  <div
+                    class="absolute bottom-full left-0 mb-2 w-48 p-2 bg-slate-800 border border-white/10 rounded-xl shadow-2xl opacity-0 invisible group-hover/tip:opacity-100 group-hover/tip:visible transition-all duration-300 z-50 pointer-events-none"
+                  >
+                    <p class="text-[10px] text-slate-300 leading-relaxed">
+                      控制 AI
+                      预测的时间跨度。较长的周期适合捕捉大级别趋势（波段），较短周期则对日内波动更敏感。
+                    </p>
+                    <div
+                      class="absolute -bottom-1 left-4 w-2 h-2 bg-slate-800 border-r border-b border-white/10 rotate-45"
+                    ></div>
+                  </div>
+                </div>
                 <span class="text-xs font-mono text-indigo-400"
                   >{{ predictionDays }}d</span
                 >
@@ -987,10 +1222,28 @@ onUnmounted(() => {
 
             <div class="space-y-3">
               <div class="flex justify-between items-center">
-                <label
-                  class="text-[10px] text-slate-500 uppercase font-bold tracking-widest"
-                  >移动止损 (%)</label
-                >
+                <div class="flex items-center gap-2 group/tip relative">
+                  <label
+                    class="text-[10px] text-slate-500 uppercase font-bold tracking-widest cursor-help"
+                    >移动止损 (%)</label
+                  >
+                  <Info
+                    class="w-3 h-3 text-slate-600 hover:text-rose-400 transition-colors cursor-help"
+                  />
+                  <!-- Premium Tooltip -->
+                  <div
+                    class="absolute bottom-full left-0 mb-2 w-48 p-2 bg-slate-800 border border-white/10 rounded-xl shadow-2xl opacity-0 invisible group-hover/tip:opacity-100 group-hover/tip:visible transition-all duration-300 z-50 pointer-events-none"
+                  >
+                    <p class="text-[10px] text-slate-300 leading-relaxed">
+                      基于持仓期间最高点进行回撤保护。例如设置
+                      -10%，则当价格从买入后的最高点回落 10%
+                      时，系统将立即清仓，保护利润。
+                    </p>
+                    <div
+                      class="absolute -bottom-1 left-4 w-2 h-2 bg-slate-800 border-r border-b border-white/10 rotate-45"
+                    ></div>
+                  </div>
+                </div>
                 <span class="text-xs font-mono text-rose-400"
                   >{{ stopLoss }}%</span
                 >
@@ -1007,10 +1260,27 @@ onUnmounted(() => {
 
             <div class="space-y-3">
               <div class="flex justify-between items-center">
-                <label
-                  class="text-[10px] text-slate-500 uppercase font-bold tracking-widest"
-                  >信号平滑 (天)</label
-                >
+                <div class="flex items-center gap-2 group/tip relative">
+                  <label
+                    class="text-[10px] text-slate-500 uppercase font-bold tracking-widest cursor-help"
+                    >信号平滑 (天)</label
+                  >
+                  <Info
+                    class="w-3 h-3 text-slate-600 hover:text-emerald-400 transition-colors cursor-help"
+                  />
+                  <!-- Premium Tooltip -->
+                  <div
+                    class="absolute bottom-full left-0 mb-2 w-48 p-2 bg-slate-800 border border-white/10 rounded-xl shadow-2xl opacity-0 invisible group-hover/tip:opacity-100 group-hover/tip:visible transition-all duration-300 z-50 pointer-events-none"
+                  >
+                    <p class="text-[10px] text-slate-300 leading-relaxed">
+                      买入/卖出信号的忍耐窗口。例如设置为
+                      3，表示系统需要连续确认数天信号的稳定性，避免因短期剧烈波动而频繁进出。
+                    </p>
+                    <div
+                      class="absolute -bottom-1 left-4 w-2 h-2 bg-slate-800 border-r border-b border-white/10 rotate-45"
+                    ></div>
+                  </div>
+                </div>
                 <span class="text-xs font-mono text-emerald-400"
                   >{{ gracePeriod }}d</span
                 >
@@ -1023,6 +1293,120 @@ onUnmounted(() => {
                 step="1"
                 class="w-full accent-emerald-500 h-1 bg-slate-800 rounded-lg appearance-none cursor-pointer"
               />
+            </div>
+
+            <!-- 新增：风控深化配置项 -->
+            <div class="space-y-3 pt-2 border-t border-white/5">
+              <div class="flex justify-between items-center">
+                <div class="flex items-center gap-2 group/tip relative">
+                  <label
+                    class="text-[10px] text-indigo-400 uppercase font-bold tracking-widest cursor-help"
+                    >仓位占比</label
+                  >
+                  <Info
+                    class="w-3 h-3 text-indigo-400/60 hover:text-indigo-400 transition-colors cursor-help"
+                  />
+                  <!-- Premium Tooltip -->
+                  <div
+                    class="absolute bottom-full left-0 mb-2 w-48 p-2 bg-slate-800 border border-white/10 rounded-xl shadow-2xl opacity-0 invisible group-hover/tip:opacity-100 group-hover/tip:visible transition-all duration-300 z-50 pointer-events-none"
+                  >
+                    <p class="text-[10px] text-slate-300 leading-relaxed">
+                      单次交易所能投入的资金占当前总可支配本金的比例。例如设置为
+                      50%，则每次买入仅投入一半仓位，降低系统性风险。
+                    </p>
+                    <div
+                      class="absolute -bottom-1 left-4 w-2 h-2 bg-slate-800 border-r border-b border-white/10 rotate-45"
+                    ></div>
+                  </div>
+                </div>
+                <span class="text-xs font-mono text-indigo-400"
+                  >{{ (posRatio * 100).toFixed(0) }}%</span
+                >
+              </div>
+              <input
+                v-model.number="posRatio"
+                type="range"
+                min="0.1"
+                max="1.0"
+                step="0.1"
+                class="w-full accent-indigo-500 h-1 bg-slate-800 rounded-lg appearance-none cursor-pointer"
+              />
+            </div>
+
+            <div class="space-y-3">
+              <div class="flex justify-between items-center">
+                <div class="flex items-center gap-2 group/tip relative">
+                  <label
+                    class="text-[10px] text-amber-400 uppercase font-bold tracking-widest cursor-help"
+                    >账户熔断阀值</label
+                  >
+                  <Info
+                    class="w-3 h-3 text-amber-400/60 hover:text-amber-400 transition-colors cursor-help"
+                  />
+                  <!-- Premium Tooltip -->
+                  <div
+                    class="absolute bottom-full left-0 mb-2 w-48 p-2 bg-slate-800 border border-white/10 rounded-xl shadow-2xl opacity-0 invisible group-hover/tip:opacity-100 group-hover/tip:visible transition-all duration-300 z-50 pointer-events-none"
+                  >
+                    <p class="text-[10px] text-slate-300 leading-relaxed">
+                      最终风控红线。一旦整个账户的累计回撤超过该阈值（基于最高点资产），系统将瞬间平仓止损并锁定交易，防止极端深度损失。
+                    </p>
+                    <div
+                      class="absolute -bottom-1 left-4 w-2 h-2 bg-slate-800 border-r border-b border-white/10 rotate-45"
+                    ></div>
+                  </div>
+                </div>
+                <span class="text-xs font-mono text-amber-400"
+                  >{{ maxAccountDrawdown }}%</span
+                >
+              </div>
+              <input
+                v-model.number="maxAccountDrawdown"
+                type="range"
+                min="5"
+                max="50"
+                step="5"
+                class="w-full accent-amber-500 h-1 bg-slate-800 rounded-lg appearance-none cursor-pointer"
+              />
+            </div>
+
+            <div
+              class="flex items-center justify-between p-3 bg-slate-800/30 rounded-xl border border-white/5"
+            >
+              <div class="flex items-center gap-2 group/tip relative">
+                <label
+                  class="text-[10px] text-slate-400 uppercase font-bold tracking-widest cursor-help"
+                  >启用 ATR 动态止损</label
+                >
+                <Info
+                  class="w-3.5 h-3.5 text-slate-500 hover:text-blue-400 transition-colors cursor-help"
+                />
+
+                <!-- Premium Tooltip -->
+                <div
+                  class="absolute bottom-full left-0 mb-2 w-48 p-2 bg-slate-800 border border-white/10 rounded-xl shadow-2xl opacity-0 invisible group-hover/tip:opacity-100 group-hover/tip:visible transition-all duration-300 z-50 pointer-events-none"
+                >
+                  <p
+                    class="text-[10px] text-slate-300 leading-relaxed font-medium"
+                  >
+                    <span class="text-blue-400 font-bold">ATR 动态止损：</span>
+                    基于市场波动率 (ATR)
+                    自动调整。波动剧烈时给持仓更多空间，行情平稳时快速锁利。
+                  </p>
+                  <div
+                    class="absolute -bottom-1 left-4 w-2 h-2 bg-slate-800 border-r border-b border-white/10 rotate-45"
+                  ></div>
+                </div>
+              </div>
+              <button
+                @click="useAtrStop = !useAtrStop"
+                class="w-10 h-5 rounded-full relative transition-all duration-300"
+                :class="useAtrStop ? 'bg-blue-500' : 'bg-slate-700'"
+              >
+                <div
+                  class="absolute top-1 left-1 w-3 h-3 bg-white rounded-full transition-all duration-300"
+                  :class="useAtrStop ? 'translate-x-5' : 'translate-x-0'"
+                ></div>
+              </button>
             </div>
 
             <p class="text-[9px] text-slate-600 leading-relaxed italic">
@@ -1048,132 +1432,6 @@ onUnmounted(() => {
               <Play v-else class="w-5 h-5 fill-current" />
               {{ isLoading ? "模型计算中..." : "启动波段回测" }}
             </button>
-          </div>
-        </div>
-
-        <!-- 交易日志区域 -->
-        <div
-          class="glass p-6 rounded-3xl border border-white/5 h-[350px] flex flex-col overflow-hidden relative"
-        >
-          <!-- 加载遮罩 -->
-          <div
-            v-if="isTradesLoading"
-            class="absolute inset-0 z-10 bg-slate-950/50 backdrop-blur-sm rounded-3xl flex items-center justify-center"
-          >
-            <Loader2 class="w-5 h-5 animate-spin text-blue-400" />
-          </div>
-          <h3 class="text-xl font-semibold mb-4 flex items-center gap-2">
-            <List class="w-5 h-5 text-blue-400" /> 交易流水
-            <Loader2
-              v-if="isTradesLoading"
-              class="w-4 h-4 animate-spin text-blue-400"
-            />
-          </h3>
-          <div class="flex-1 overflow-y-auto space-y-3 pr-2 scrollbar-none">
-            <div
-              v-if="trades.length === 0"
-              class="text-slate-600 text-center py-10 text-xs italic"
-            >
-              暂无成交记录
-            </div>
-            <div
-              v-for="t in trades"
-              :key="t.date"
-              class="p-3 bg-white/5 rounded-xl border border-white/5 text-xs flex justify-between items-center"
-            >
-              <div>
-                <div
-                  class="font-bold flex items-center gap-1"
-                  :class="
-                    t.type === 'BUY' ? 'text-emerald-400' : 'text-rose-400'
-                  "
-                >
-                  <span
-                    class="w-1.5 h-1.5 rounded-full"
-                    :class="t.type === 'BUY' ? 'bg-emerald-400' : 'bg-rose-400'"
-                  ></span>
-                  {{ t.type }}
-                </div>
-                <div class="text-[10px] text-slate-500 mt-0.5">
-                  {{ t.date }}
-                </div>
-              </div>
-              <div class="text-right font-mono text-slate-200">
-                ${{ t.price }}
-              </div>
-            </div>
-          </div>
-        </div>
-
-        <!-- 历史回测存档 -->
-        <div
-          class="glass p-6 rounded-3xl border border-white/5 flex-1 flex flex-col overflow-hidden min-h-[350px] relative"
-        >
-          <!-- 加载遮罩 -->
-          <div
-            v-if="isHistoryLoading"
-            class="absolute inset-0 z-10 bg-slate-950/50 backdrop-blur-sm rounded-3xl flex items-center justify-center"
-          >
-            <Loader2 class="w-5 h-5 animate-spin text-amber-400" />
-          </div>
-          <h3 class="text-xl font-semibold mb-4 flex items-center gap-2">
-            <Award class="w-5 h-5 text-amber-400" /> 历史回测存档
-            <Loader2
-              v-if="isHistoryLoading"
-              class="w-4 h-4 animate-spin text-amber-400"
-            />
-          </h3>
-          <div class="flex-1 overflow-y-auto space-y-3 pr-2 scrollbar-none">
-            <div
-              v-if="backtestHistory.length === 0"
-              class="text-slate-600 text-center py-10 text-xs italic"
-            >
-              暂无历史记录
-            </div>
-            <div
-              v-for="h in backtestHistory"
-              :key="h.id"
-              class="p-4 bg-white/5 rounded-2xl border border-white/5 hover:border-amber-500/30 transition-all group flex justify-between items-center cursor-pointer relative"
-              @click="symbol = h.symbol"
-            >
-              <div class="flex flex-col gap-1">
-                <div class="flex items-center gap-2">
-                  <span
-                    class="text-xs font-black text-white px-2 py-0.5 bg-slate-800 rounded border border-white/10 uppercase"
-                    >{{ h.symbol }}</span
-                  >
-                  <span class="text-[10px] text-slate-500 font-mono">{{
-                    h.timestamp
-                  }}</span>
-                </div>
-                <div class="flex gap-3 mt-1">
-                  <span class="text-[10px] uppercase font-bold text-slate-400"
-                    >收益:
-                    <span
-                      :class="
-                        h.metrics.total_return >= 0
-                          ? 'text-emerald-400'
-                          : 'text-rose-400'
-                      "
-                      >{{ h.metrics.total_return }}%</span
-                    ></span
-                  >
-                  <span class="text-[10px] uppercase font-bold text-slate-400"
-                    >夏普:
-                    <span class="text-blue-400">{{
-                      h.metrics.sharpe_ratio
-                    }}</span></span
-                  >
-                </div>
-              </div>
-
-              <button
-                @click="deleteHistory(h.id, $event)"
-                class="opacity-0 group-hover:opacity-100 p-2 hover:bg-rose-500/20 text-rose-500 rounded-lg transition-all"
-              >
-                <Trash2 class="w-4 h-4" />
-              </button>
-            </div>
           </div>
         </div>
       </div>
@@ -1211,7 +1469,7 @@ onUnmounted(() => {
                     : 'text-slate-400 hover:text-white',
                   isChartDataLoading || isIntradayLoading
                     ? 'opacity-50 cursor-not-allowed'
-                    : 'cursor-pointer'
+                    : 'cursor-pointer',
                 ]"
               >
                 日线模式
@@ -1226,7 +1484,7 @@ onUnmounted(() => {
                     : 'text-slate-400 hover:text-white',
                   isChartDataLoading || isIntradayLoading
                     ? 'opacity-50 cursor-not-allowed'
-                    : 'cursor-pointer'
+                    : 'cursor-pointer',
                 ]"
               >
                 <div
@@ -1236,7 +1494,86 @@ onUnmounted(() => {
                 分时图
               </button>
             </div>
-            <div class="flex gap-2">
+            <div class="flex gap-2 items-center">
+              <div
+                v-if="chartMode === 'intraday' && intradayData"
+                class="flex items-center gap-3 mr-4 px-4 py-1.5 bg-slate-800/80 border border-white/5 rounded-2xl shadow-inner group"
+              >
+                <div class="flex flex-col items-end">
+                  <div class="flex items-center gap-2">
+                    <span
+                      class="text-[10px] text-slate-500 font-bold uppercase tracking-widest group-hover:text-blue-400 transition-colors"
+                      >最新价</span
+                    >
+                    <span
+                      class="text-lg font-black font-mono text-white leading-none"
+                    >
+                      {{
+                        (intradayData as any).length > 0
+                          ? (intradayData as any)[
+                              (intradayData as any).length - 1
+                            ].price
+                          : realtimeSignal?.current_price || "0.00"
+                      }}
+                    </span>
+                  </div>
+                  <div
+                    v-if="
+                      (intradayData as any).prev_close ||
+                      realtimeSignal?.prev_close
+                    "
+                    class="flex items-center gap-1 mt-0.5"
+                  >
+                    <span class="text-[9px] text-slate-600 font-medium"
+                      >涨跌幅</span
+                    >
+                    <span
+                      class="text-xs font-bold font-mono"
+                      :class="{
+                        'text-emerald-400':
+                          (((intradayData as any).length > 0
+                            ? (intradayData as any)[
+                                (intradayData as any).length - 1
+                              ].price
+                            : realtimeSignal?.current_price || 0) -
+                            ((intradayData as any).prev_close ||
+                              realtimeSignal.prev_close)) /
+                            ((intradayData as any).prev_close ||
+                              realtimeSignal.prev_close) >=
+                          0,
+                        'text-rose-400':
+                          (((intradayData as any).length > 0
+                            ? (intradayData as any)[
+                                (intradayData as any).length - 1
+                              ].price
+                            : realtimeSignal?.current_price || 0) -
+                            ((intradayData as any).prev_close ||
+                              realtimeSignal.prev_close)) /
+                            ((intradayData as any).prev_close ||
+                              realtimeSignal.prev_close) <
+                          0,
+                      }"
+                    >
+                      {{
+                        (
+                          ((((intradayData as any).length > 0
+                            ? (intradayData as any)[
+                                (intradayData as any).length - 1
+                              ].price
+                            : realtimeSignal?.current_price || 0) -
+                            ((intradayData as any).prev_close ||
+                              realtimeSignal?.prev_close ||
+                              1)) /
+                            ((intradayData as any).prev_close ||
+                              realtimeSignal?.prev_close ||
+                              1)) *
+                          100
+                        ).toFixed(2)
+                      }}%
+                    </span>
+                  </div>
+                </div>
+              </div>
               <div
                 class="px-3 py-1 bg-blue-500/10 border border-blue-500/20 rounded-full text-[10px] text-blue-400 uppercase font-bold tracking-widest"
               >
@@ -1257,6 +1594,159 @@ onUnmounted(() => {
             class="absolute -bottom-24 -left-24 w-96 h-96 bg-blue-500/5 blur-[100px] rounded-full pointer-events-none"
           ></div>
         </div>
+
+        <!-- 下部网格区域 (交易日志 & 历史存档) -->
+        <div class="grid grid-cols-1 gap-6 w-full">
+          <!-- 交易日志区域 -->
+          <div
+            class="glass p-6 rounded-3xl border border-white/5 overflow-hidden relative"
+          >
+            <!-- 加载遮罩 -->
+            <div
+              v-if="isTradesLoading"
+              class="absolute inset-0 z-10 bg-slate-950/50 backdrop-blur-sm rounded-3xl flex items-center justify-center"
+            >
+              <Loader2 class="w-5 h-5 animate-spin text-blue-400" />
+            </div>
+            <h3 class="text-xl font-semibold mb-4 flex items-center gap-2">
+              <List class="w-5 h-5 text-blue-400" /> 交易流水
+              <Loader2
+                v-if="isTradesLoading"
+                class="w-4 h-4 animate-spin text-blue-400"
+              />
+            </h3>
+            <div
+              class="overflow-x-auto flex gap-4 pb-4 scrollbar-thin items-stretch min-h-[160px]"
+            >
+              <div
+                v-if="trades.length === 0"
+                class="text-slate-600 text-center py-10 text-xs italic w-full"
+              >
+                暂无成交记录
+              </div>
+              <div
+                v-for="t in trades"
+                :key="t.date"
+                class="min-w-[250px] flex-shrink-0 p-4 bg-white/5 rounded-2xl border border-white/5 text-xs flex flex-col justify-between"
+              >
+                <div>
+                  <div class="flex items-center gap-2">
+                    <span
+                      v-if="t.symbol"
+                      class="px-1.5 py-0.5 rounded bg-indigo-500/20 text-indigo-400 text-[9px] font-bold border border-indigo-500/20"
+                      >{{ t.symbol }}</span
+                    >
+                    <span
+                      class="font-medium"
+                      :class="
+                        t.type === 'BUY' ? 'text-emerald-400' : 'text-rose-400'
+                      "
+                    >
+                      {{ t.type === "BUY" ? "买入" : "卖出" }}
+                    </span>
+                    <span class="text-slate-300">{{ t.price }}</span>
+                    <span
+                      v-if="t.fee"
+                      class="text-[10px] text-slate-500 bg-white/5 px-1 rounded"
+                    >
+                      费: {{ t.fee }}
+                    </span>
+                  </div>
+                  <div class="text-[10px] text-slate-500 mt-1">
+                    {{ t.date }} | {{ t.reason }}
+                  </div>
+                </div>
+                <!-- 底部金额 -->
+                <div
+                  class="flex justify-between items-end mt-3 pt-3 border-t border-white/5"
+                >
+                  <div class="text-[10px] text-slate-500 lowercase">
+                    balance
+                  </div>
+                  <div class="text-slate-300 font-mono text-sm font-bold">
+                    {{ t.remaining_capital }}
+                  </div>
+                </div>
+              </div>
+            </div>
+          </div>
+
+          <!-- 历史回测存档 -->
+          <div
+            class="glass p-6 rounded-3xl border border-white/5 overflow-hidden relative"
+          >
+            <!-- 加载遮罩 -->
+            <div
+              v-if="isHistoryLoading"
+              class="absolute inset-0 z-10 bg-slate-950/50 backdrop-blur-sm rounded-3xl flex items-center justify-center"
+            >
+              <Loader2 class="w-5 h-5 animate-spin text-amber-400" />
+            </div>
+            <h3 class="text-xl font-semibold mb-4 flex items-center gap-2">
+              <Award class="w-5 h-5 text-amber-400" /> 历史回测存档
+              <Loader2
+                v-if="isHistoryLoading"
+                class="w-4 h-4 animate-spin text-amber-400"
+              />
+            </h3>
+            <div
+              class="overflow-x-auto flex gap-4 pb-4 scrollbar-thin items-stretch min-h-[160px]"
+            >
+              <div
+                v-if="backtestHistory.length === 0"
+                class="text-slate-600 text-center py-10 text-xs italic w-full"
+              >
+                暂无历史记录
+              </div>
+              <div
+                v-for="h in backtestHistory"
+                :key="h.id"
+                class="min-w-[260px] flex-shrink-0 p-5 bg-white/5 rounded-2xl border border-white/5 hover:border-amber-500/30 transition-all group flex flex-col justify-between cursor-pointer relative"
+                @click="symbol = h.symbol"
+              >
+                <div class="flex flex-col gap-1">
+                  <div class="flex items-center gap-2">
+                    <span
+                      class="text-xs font-black text-white px-2 py-0.5 bg-slate-800 rounded border border-white/10 uppercase"
+                      >{{ h.symbol }}</span
+                    >
+                    <span class="text-[10px] text-slate-500 font-mono">{{
+                      h.timestamp
+                    }}</span>
+                  </div>
+                  <div class="flex gap-3 mt-1">
+                    <span class="text-[10px] uppercase font-bold text-slate-400"
+                      >收益:
+                      <span
+                        :class="
+                          h.metrics.total_return >= 0
+                            ? 'text-emerald-400'
+                            : 'text-rose-400'
+                        "
+                        >{{ h.metrics.total_return }}%</span
+                      ></span
+                    >
+                    <span class="text-[10px] uppercase font-bold text-slate-400"
+                      >夏普:
+                      <span class="text-blue-400">{{
+                        h.metrics.sharpe_ratio
+                      }}</span></span
+                    >
+                  </div>
+                </div>
+
+                <div class="absolute top-4 right-4">
+                  <button
+                    @click="deleteHistory(h.id, $event)"
+                    class="opacity-0 group-hover:opacity-100 p-2 hover:bg-rose-500/20 text-rose-500 rounded-lg transition-all"
+                  >
+                    <Trash2 class="w-4 h-4" />
+                  </button>
+                </div>
+              </div>
+            </div>
+          </div>
+        </div>
       </div>
     </div>
   </div>
@@ -1276,5 +1766,21 @@ onUnmounted(() => {
 .scrollbar-none {
   -ms-overflow-style: none;
   scrollbar-width: none;
+}
+
+.scrollbar-thin::-webkit-scrollbar {
+  height: 6px;
+  width: 6px;
+}
+.scrollbar-thin::-webkit-scrollbar-track {
+  background: rgba(255, 255, 255, 0.02);
+  border-radius: 4px;
+}
+.scrollbar-thin::-webkit-scrollbar-thumb {
+  background: rgba(255, 255, 255, 0.1);
+  border-radius: 4px;
+}
+.scrollbar-thin::-webkit-scrollbar-thumb:hover {
+  background: rgba(255, 255, 255, 0.2);
 }
 </style>
