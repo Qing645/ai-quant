@@ -31,16 +31,16 @@ const handleLogout = () => {
     <Login @login-success="handleLoginSuccess" />
   </div>
   <div v-else class="min-h-screen p-4 md:p-8 bg-slate-950 text-slate-200">
-    <header class="max-w-[1800px] mx-auto mb-8 flex justify-between items-center">
+    <header
+      class="max-w-[1800px] mx-auto mb-8 flex justify-between items-center"
+    >
       <div>
         <h1
           class="text-4xl font-black bg-gradient-to-r from-emerald-400 to-cyan-400 bg-clip-text text-transparent tracking-tighter"
         >
-          Local AI Quant
+          AI Quant
         </h1>
-        <p class="text-slate-500 mt-1 text-sm font-medium">
-          本地 AI 量化交易仪表盘 (Vue 3 + TS + XGBoost)
-        </p>
+        <p class="text-slate-500 mt-1 text-sm font-medium">AI 量化交易系统</p>
       </div>
       <div class="flex items-center gap-4">
         <div

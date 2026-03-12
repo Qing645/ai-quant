@@ -1,6 +1,6 @@
-# Local AI Quant Model
+# AI Quant Model
 
-这是一个运行在本地的 AI 量化模型架构，使用 XGBoost 进行股价趋势预测，并集成 AkShare 获取 A 股及 ETF 高精度数据。项目包含后端 FastAPI 接口和前端 Vue3 交互式大盘。
+这是一个 AI 量化模型架构，使用 XGBoost 进行股价趋势预测，并集成 AkShare 获取 A 股及 ETF 高精度数据。项目包含后端 FastAPI 接口和前端 Vue3 交互式大盘。
 
 ## 🚀 启动指南
 

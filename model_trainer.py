@@ -11,11 +11,11 @@ def train_model(data_path, model_output_path, backtest_output_path="backtest_dat
     """
     df = pd.read_csv(data_path)
     
-    # 特征列定义 (同步 4.1 召回的 OBV/VPT)
+    # 特征列定义 (同步 4.2 爆发力因子)
     feature_cols = [
         'rsi', 'macd', 'macd_signal', 'sma_20_dist', 'volatility', 
-        'body_size', 'upper_shadow', 'vol_ratio', 'bb_p', 'roc',
-        'obv_roc', 'vpt_roc'
+        'atr_20', 'body_size', 'upper_shadow', 'vol_ratio', 'bb_p', 'roc',
+        'obv_roc', 'vpt_roc', 'vol_spike', 'momentum_accel'
     ]
     
     X = df[feature_cols].copy()
@@ -29,7 +29,7 @@ def train_model(data_path, model_output_path, backtest_output_path="backtest_dat
     windows = [120, 250, 500]
     models = []
     
-    print(f"滚动集成训练启动4.1 - 样本: {len(X_labeled)}")
+    print(f"滚动集成训练启动4.2 - 样本: {len(X_labeled)}")
     
     for w_size in windows:
         train_idx = X_labeled.index[max(0, len(X_labeled) - w_size):]
@@ -37,9 +37,9 @@ def train_model(data_path, model_output_path, backtest_output_path="backtest_dat
         y_w = y_labeled.loc[train_idx]
         
         m = xgb.XGBClassifier(
-            n_estimators=60,
+            n_estimators=70,  # 适度增加树数量捕捉细节
             max_depth=4,
-            learning_rate=0.08,
+            learning_rate=0.07,
             subsample=0.8,
             random_state=42,
             eval_metric='logloss'
@@ -56,8 +56,8 @@ def train_model(data_path, model_output_path, backtest_output_path="backtest_dat
     
     final_probs /= len(models)
     
-    # 策略激进化调整：由 85% -> 75% 提升捕捉率 (增加交易频率以博取更高累计收益)
-    threshold = np.percentile(final_probs, 75)
+    # 策略激进化调整：由 85% -> 72% 进一步捕捉机会
+    threshold = np.percentile(final_probs, 72)
     if threshold < 0.35: threshold = 0.35
     elif threshold > 0.55: threshold = 0.55
     
@@ -70,8 +70,9 @@ def train_model(data_path, model_output_path, backtest_output_path="backtest_dat
     
     test_df = df.loc[X_full.index].copy()
     test_df['predicted_signal'] = y_pred
+    test_df['prediction_prob'] = final_probs # 关键：透传概率
     test_df.to_csv(backtest_output_path, index=False)
-    print(f"集成完成，{backtest_output_path} 已更新。阈值: {threshold:.3f}")
+    print(f"集成完成，{backtest_output_path} 已更新。平均概率已注入。")
 
 
 if __name__ == "__main__":

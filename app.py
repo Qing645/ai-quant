@@ -21,7 +21,7 @@ import auth
 from auth import get_current_user
 from sqlalchemy.orm import Session
 
-app = FastAPI(title="Local AI Quant API")
+app = FastAPI(title="AI Quant API")
 
 # 初始化数据库
 init_db()
@@ -426,7 +426,7 @@ def _translate_to_chinese(text: str) -> str:
             return translated
     except Exception as e:
         print(f"数据获取失败: {e}")
-        return []
+        return ""
 
 @app.get("/api/market/insights")
 async def get_market_insights():
@@ -439,7 +439,6 @@ async def get_market_insights():
         return INSIGHT_CACHE["data"]
         
     try:
-        # 在异步环境下调用同步抓取 (考虑未来使用 run_in_executor)
         data = market_insight.get_market_insights()
         INSIGHT_CACHE = {"data": data, "ts": now}
         return data
@@ -457,34 +456,28 @@ async def check_realtime_signal(symbol: str = "159915.SZ"):
     import numpy as np
     import time
     
-    # 1. 模型缓存检查 (单例模式)
+    # 1. 模型缓存检查
     if MODEL_CACHE is None:
         if os.path.exists(MODEL_FILE):
-            print(f"  [Perf] 正在初始加载 AI 模型至内存...")
             MODEL_CACHE = joblib.load(MODEL_FILE)
         else:
-            return {"status": "error", "message": "模型未就绪，请先运行回测训练。"}
+            return {"status": "error", "message": "模型未就绪"}
             
     try:
-        # 2. 获取实时行情 (这是目前最耗时的 IO 步骤)
+        # 2. 获取实时行情
         quote = data_fetcher.fetch_realtime_quote(symbol)
         if not quote:
             return {"status": "error", "message": "无法获取实时行情"}
             
-        # 3. 历史数据缓存检查
-        now = time.time()
-        if DATA_CACHE is None or (now - CACHE_TIMESTAMP > CACHE_EXPIRE):
-            if os.path.exists(BACKTEST_FILE):
-                print(f"  [Perf] 正在刷新历史行情缓存 (Source: {BACKTEST_FILE})...")
-                DATA_CACHE = pd.read_csv(BACKTEST_FILE)
-                CACHE_TIMESTAMP = now
-            else:
-                return {"status": "error", "message": "回测数据缺失，请先运行回测管线。"}
+        # 3. 历史数据读取 (PM 重大更新：强制读取该标的的专属回测文件)
+        symbol_backtest = f"backtest_{symbol}.csv"
+        target_csv = symbol_backtest if os.path.exists(symbol_backtest) else BACKTEST_FILE
         
-        hist_df = DATA_CACHE.copy()
+        print(f"  [PM Core] 正在从 {target_csv} 加载战略信号基准...")
+        hist_df = pd.read_csv(target_csv)
         
         # 4. 实时点热更新
-        if hist_df.iloc[-1]['date'] == quote['date']:
+        if not hist_df.empty and str(hist_df.iloc[-1]['date']) == str(quote['date']):
             for col in ['close', 'high', 'low', 'volume']:
                 if col in hist_df.columns:
                     if col == 'high':
@@ -497,53 +490,88 @@ async def check_realtime_signal(symbol: str = "159915.SZ"):
             new_row = pd.DataFrame([quote])
             hist_df = pd.concat([hist_df, new_row], ignore_index=True)
             
-        # 5. 增量特征计算优化
-        subset_df = hist_df.tail(100).copy()
-        processed_df = feature_engineer.prepare_features(subset_df)
+        # 5. 特征预计算
+        processed_df = feature_engineer.prepare_features(hist_df.tail(100).copy())
         
-        # 6. 使用缓存的模型推理
+        # 6. 模型推理
         model = MODEL_CACHE
         feature_cols = [
             'rsi', 'macd', 'macd_signal', 'sma_20_dist', 'volatility', 
-            'body_size', 'upper_shadow', 'vol_ratio', 'bb_p', 'roc',
-            'obv_roc', 'vpt_roc'
+            'atr_20', 'body_size', 'upper_shadow', 'vol_ratio', 'bb_p', 'roc',
+            'obv_roc', 'vpt_roc', 'vol_spike', 'momentum_accel'
         ]
-        
-        missing = [c for c in feature_cols if c not in processed_df.columns]
-        if missing:
-            processed_df = feature_engineer.prepare_features(hist_df.copy())
-            
         X_latest = processed_df[feature_cols].tail(1)
         
         if isinstance(model, list):
             probs = [m.predict_proba(X_latest)[0, 1] for m in model]
             prob = float(np.mean(probs))
-            print(f"  [Ensemble] 实时诊断共识度: {prob:.4f} | 专家子集: {[round(p, 2) for p in probs]}")
+            print(f"  [Ensemble] 实时诊断共识度: {prob:.4f}")
         else:
             prob = float(model.predict_proba(X_latest)[0, 1])
 
-        # 动态判定
+        # 判定
         threshold = 0.5
         signal = 1 if prob >= threshold else 0
         
-        # 实时翻转告警
-        if symbol in LAST_SIGNALS and LAST_SIGNALS[symbol] != signal:
-            emoji = "🚀" if signal == 1 else "⚠️"
-            msg = "买点出现：AI 检测到多头动能爆发！" if signal == 1 else "趋势见顶：建议分开止盈防范回撤。"
-            print(f"\n{emoji} 【AI 信号翻转告警】 {symbol} | {msg} (自信度: {prob:.2f})")
-            
-        LAST_SIGNALS[symbol] = signal
+        # --- [PM Sprint 10.0] 跨周期信号共识深度审计 ---
+        is_divergent = False
+        daily_signal = None
+        if not hist_df.empty:
+            # 查找最后一个具有预测信号的日线点
+            valid_days = hist_df[hist_df['predicted_signal'].notna()]
+            if not valid_days.empty:
+                daily_signal = int(valid_days.iloc[-1]["predicted_signal"])
         
+        # 结果组装与场景研判
+        ai_signal = 1 if prob >= threshold else -1
+        is_smart_guard = False
+        
+        if daily_signal == 0:
+            if prob >= 0.5:
+                is_divergent = True
+                action_msg = "战略背离：日线看空，暂不接飞刀"
+                ai_signal = -1  # 强制长线压制截断短线多头
+            elif prob > 0.3:
+                is_divergent = True # 轻微多空分歧也作为黄字预警
+                action_msg = "战略防护：日线处空仓期，建议观望"
+                ai_signal = -1
+            else:
+                is_divergent = False
+                action_msg = "战略共识：长短线均看空，保持空仓状态"
+            is_smart_guard = True
+        elif daily_signal == 1:
+            if prob < 0.3:
+                is_divergent = True
+                action_msg = "战略背离：分时下挫过快，注意阶段回调"
+            elif prob < 0.5:
+                is_divergent = False
+                action_msg = "分时震荡：长线看多，可寻觅逢低吸纳机会"
+            else:
+                is_divergent = False
+                action_msg = "战略共识：长短线均看多，建议持仓或加仓"
+                is_smart_guard = (prob >= 0.8)
+        else:
+            if prob >= 0.8:
+                action_msg = "强烈看多 (Strong Buy)"
+                is_smart_guard = True
+            elif prob >= 0.5:
+                action_msg = "建议买入 (Buy)"
+            elif prob >= 0.3:
+                action_msg = "震荡观望 (Hold)"
+            else:
+                action_msg = "建议离场 (Sell)"
+
         return {
             "status": "success",
             "symbol": symbol,
             "current_price": round(float(quote['close']), 3),
-            "change_pct": round(((quote['close'] - quote.get('prev_close', 0)) / quote.get('prev_close', 1)) * 100, 2) if quote.get('prev_close', 0) != 0 else 0,
-            "prev_close": round(float(quote.get('prev_close', 0)), 3),
             "ai_confidence": round(float(prob), 4),
-            "threshold_ref": round(float(threshold), 4),
-            "signal": signal,
-            "action": "BUY (建议买入)" if signal == 1 else "HOLD/SELL (持币或减仓)",
+            "ai_signal": ai_signal, # 对齐前端
+            "signal": signal,       # 保持向下兼容
+            "action": action_msg,
+            "is_smart_guard": is_smart_guard,
+            "is_divergent": is_divergent,
+            "daily_signal_ref": daily_signal,
             "updated_at": datetime.now().strftime("%H:%M:%S")
         }
         
@@ -560,16 +588,21 @@ def get_stock_info(symbol: str, db: Session = Depends(database.get_db)):
     # 1. 优先尝试从数据库读取缓存
     cached = db.query(database.StockMetadata).filter(database.StockMetadata.symbol == symbol).first()
     if cached:
-        # 简单逻辑：7天内不重复刷数据 (可选)
-        return {
-            "name": cached.name,
-            "sector": cached.sector,
-            "industry": cached.industry,
-            "currency": cached.currency,
-            "exchange": cached.exchange,
-            "summary": cached.summary,
-            "from_cache": True
-        }
+        # 核心防御：如果 A 股缓存了英文名，强制标记失效以触发重新下载并修正
+        is_a_share = symbol.lower().endswith((".sh", ".sz", ".ss", ".bj"))
+        bad_keywords = ["China", "Energy", "Engineering", "Corporation", "Ltd", "Co."]
+        is_bad_cache = is_a_share and any(bad in cached.name for bad in bad_keywords)
+        
+        if not is_bad_cache:
+            return {
+                "name": cached.name,
+                "sector": cached.sector,
+                "industry": cached.industry,
+                "currency": cached.currency,
+                "exchange": cached.exchange,
+                "summary": cached.summary,
+                "from_cache": True
+            }
 
     # 常用板块和行业翻译映射
     TRANSLATIONS = {
@@ -645,28 +678,43 @@ def get_stock_info(symbol: str, db: Session = Depends(database.get_db)):
                             found_name = match.iloc[0]['名称']
                     except:
                         pass
+                
                 if found_name:
                     name = found_name
+                else:
+                    # 最后的防御：如果 AkShare 失败且依然是英文名，强制翻译一次
+                    if any(bad in name for bad in ["China", "Energy", "Engineering", "Corporation", "Ltd", "Inc"]):
+                        name = _translate_to_chinese(name) or name
         
         currency = info.get("currency", "USD")
         if currency == "CNY": currency = "人民币 (CNY)"
         exchange = info.get("exchange", "未知交易所")
 
-        # 2. 写入/更新缓存
+        # 2. 写入/更新缓存 (使用查询更新模式以适配 SQLite 唯一索引)
         try:
-            new_meta = database.StockMetadata(
-                symbol=symbol,
-                name=name,
-                sector=sector,
-                industry=industry,
-                currency=currency,
-                exchange=exchange,
-                summary=summary
-            )
-            db.merge(new_meta)
+            existing_meta = db.query(database.StockMetadata).filter(database.StockMetadata.symbol == symbol).first()
+            if existing_meta:
+                existing_meta.name = name
+                existing_meta.sector = sector
+                existing_meta.industry = industry
+                existing_meta.currency = currency
+                existing_meta.exchange = exchange
+                existing_meta.summary = summary
+                existing_meta.updated_at = datetime.now()
+            else:
+                new_meta = database.StockMetadata(
+                    symbol=symbol,
+                    name=name,
+                    sector=sector,
+                    industry=industry,
+                    currency=currency,
+                    exchange=exchange,
+                    summary=summary
+                )
+                db.add(new_meta)
             db.commit()
         except Exception as db_err:
-            print(f"缓存写入失败: {db_err}")
+            print(f"缓存持久化失败: {db_err}")
             db.rollback()
 
         return {

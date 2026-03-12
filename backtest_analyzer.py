@@ -62,51 +62,49 @@ def generate_analysis_report(metrics, trades):
     report.append(f"- **获利胜率**：当前胜率为 {win_rate}%。{'胜率较高，具备一定的盈利确定性。' if win_rate > 50 else '胜率较低，主要依靠大额盈利覆盖小额亏损，对止损要求严苛。'}")
     
     # 4. 离场归因
-    reasons = [t['reason'] for t in trades if t['type'] == 'SELL']
+    reasons = [t.get('reason', '未知理由') for t in trades if t['type'] == 'SELL']
     if reasons:
         reason_counts = pd.Series(reasons).value_counts()
         report.append("\n#### [REASONS] 核心离场归因统计")
         for r_name, count in reason_counts.items():
             pct = round(count / len(reasons) * 100, 1)
+            # 兼容中英文标签
             desc = ""
-            if r_name == "Hard Stop":
-                desc = "固定比例止损"
-            elif r_name == "Trailing Stop":
-                desc = "移动保护触发"
-            elif r_name == "ATR Stop":
-                desc = "波动率自适应止损"
-            elif r_name == "AI Signal":
-                desc = "策略模型翻转离场"
-            elif r_name == "Protect Profit":
-                desc = "利润垫锁死离场"
-            elif r_name == "Dynamic Circuit Breaker":
-                desc = "账户级强行风险熔断"
+            if "Hard Stop" in r_name or "止损" in r_name: desc = "固定比例止损"
+            elif "Trailing" in r_name or "移动" in r_name: desc = "追踪止盈保护"
+            elif "ATR" in r_name: desc = "波动率自适应离场"
+            elif "Signal" in r_name or "信号" in r_name: desc = "AI 模型预测翻转"
+            elif "Profit" in r_name or "利润" in r_name: desc = "利润垫保护离场"
+            elif "Melt" in r_name or "熔断" in r_name: desc = "账户级风险防线"
             
-            report.append(f"- **{r_name} ({desc})**：触发 {count} 次，占比 {pct}%。")
+            report.append(f"- **{r_name}**：触发 {count} 次，占比 {pct}%。({desc})")
 
     # 5. 专家建议
     report.append("\n#### [ADVICE] 专家调优建议")
     advice_list = []
     
-    # 风险类建议 (降低门槛)
+    # 针对暴涨前早撤的专项逻辑
+    signal_exits = reason_counts.get("AI 信号离场", 0) + reason_counts.get("AI Signal", 0)
+    if signal_exits > len(reasons) * 0.6 and total_return < 10:
+        advice_list.append("📌 **核心优化**：模型频繁在趋势初期离场。建议检查 `grace_period` 参数，或开启加速期`动态宽限期补偿`，防止被启动前的震荡洗出。")
+
+    # 风险类建议
     if abs(max_dd) > 10:
-        advice_list.append("🔴 **风险警示**：当前最大回撤已超过 10%。建议调低 `pos_ratio` (仓位占比) 至 0.5 左右，并检查是否开启了 `use_atr_stop`。")
+        advice_list.append("🔴 **风险警示**：最大回撤超过 10%。建议调低 `pos_ratio` 至 0.6 以下，确保极端行情下的本金安全。")
     if win_rate < 45:
-        advice_list.append("🟡 **逻辑调优**：胜率低于 45%，策略容错率较低。可尝试增加 `prediction_days` 以捕捉更长期的趋势信号。")
-    
-    # 行为类建议
-    if trade_count > 40:
-        advice_list.append("⚪ **成本提醒**：交易频率较高。请务必确认 `grace_period` (平滑期) 至少为 3，以减少无效波动引起的调仓损耗。")
+        advice_list.append("🟡 **胜率缺陷**：当前胜率不够理想。建议增加 `prediction_days` 训练时长，让模型学习更长周期的特征稳定性。")
     
     # 手法建议
-    if "Hard Stop" in reasons and reason_counts.get("Hard Stop", 0) > len(reasons) * 0.3:
-        advice_list.append("🟢 **技术建议**：硬止损触发频繁。建议切换为 `ATR 动态止损`，给标的留出更合理的波动空间。")
+    if "固定百分比硬止损" in reasons or "Hard Stop" in reasons:
+        advice_list.append("🟢 **技术建议**：硬性止损触发频繁。建议切换至 `ATR 动态止损` 模式，利用波动率自适应调整间距。")
     
-    # 常驻建议 (确保不为空)
-    advice_list.append("🔵 **常规提醒**：回测结果未包含实盘滑点与借贷成本，实际执行时请保留 10-15% 的利润冗余。")
+    # 常驻建议
+    advice_list.append("🔵 **常规提醒**：回测仅代表历史表现，实盘需关注成交滑点及模型在极端行情下的信号滞后。")
     
     for advice in advice_list:
         report.append(f"- {advice}")
+        
+    return "\n".join(report)
         
     return "\n".join(report)
 

@@ -77,11 +77,15 @@ def prepare_features(df, prediction_window=10):
     # 标签生成
     df['target'] = ((up_move > target_up) & (down_move > target_down)).astype(int)
     
+    # 7. 爆发力因子 (Spike Detection)
+    df['vol_spike'] = df['volume'] / (df['volume'].rolling(window=5).mean() + 1e-8)
+    df['momentum_accel'] = df['roc'] - df['roc'].shift(3) # 动量变化率 (加速感)
+    
     # 特征库全家桶
     feature_cols = [
         'rsi', 'macd', 'macd_signal', 'sma_20_dist', 'volatility', 
         'atr_20', 'body_size', 'upper_shadow', 'vol_ratio', 'bb_p', 'roc',
-        'obv_roc', 'vpt_roc'
+        'obv_roc', 'vpt_roc', 'vol_spike', 'momentum_accel'
     ]
     df[feature_cols] = df[feature_cols].bfill().ffill()
     df.replace([np.inf, -np.inf], 0, inplace=True)

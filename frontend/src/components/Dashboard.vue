@@ -16,7 +16,8 @@ import {
   Star,
   Info,
   Globe2,
-  ChevronRight
+  ChevronRight,
+  AlertTriangle
 } from "lucide-vue-next";
 
 const chartRef = ref<HTMLElement | null>(null);
@@ -238,11 +239,13 @@ const runPipeline = async () => {
       throw new Error(resData.detail || "管线运行失败");
     }
 
+    // 首先获取交易数据，确保 renderChart 时 trades.value 已就绪
+    await fetchTrades();
+
     await Promise.all([
       fetchStockInfo(),
       fetchChartData(),
       fetchMetrics(),
-      fetchTrades(),
       fetchLastSignal(),
       fetchHistory()
     ]);
@@ -368,8 +371,8 @@ const isTradingHours = () => {
   if (day === 0 || day === 6) return false; // 周末
 
   const time = now.getHours() * 100 + now.getMinutes();
-  // 9:30-11:30, 13:00-15:00
-  if ((time >= 930 && time <= 1130) || (time >= 1300 && time <= 1500)) {
+  // 9:30-11:30, 13:00-15:30 (放宽 30 分钟用于收盘后的数据同步确认)
+  if ((time >= 930 && time <= 1130) || (time >= 1300 && time <= 1330)) {
     return true;
   }
   return false;
@@ -602,24 +605,22 @@ const renderChart = (data: any[]) => {
     isDaily && !isPortfolioMode ? data.map((d) => d.sma_50 || null) : [];
 
   const markPoints: any[] = [];
-  if (isDaily && !isPortfolioMode) {
-    data.forEach((d, i) => {
-      const prevSignal = i > 0 ? data[i - 1].predicted_signal : 0;
-      if (d.predicted_signal === 1 && prevSignal === 0) {
+  if (isDaily && !isPortfolioMode && trades.value.length > 0) {
+    trades.value.forEach((t) => {
+      // 在当前显示的 chart 数据中找到该日期对应的索引
+      const dataIdx = data.findIndex((d) => d.date === t.date);
+      if (dataIdx !== -1) {
+        const isBuy = t.type === "BUY";
         markPoints.push({
-          name: "BUY",
-          value: "B",
-          xAxis: i,
-          yAxis: d.low,
-          itemStyle: { color: "#10b981" }
-        });
-      } else if (d.predicted_signal === 0 && prevSignal === 1) {
-        markPoints.push({
-          name: "SELL",
-          value: "S",
-          xAxis: i,
-          yAxis: d.high,
-          itemStyle: { color: "#ef4444" }
+          name: t.reason || (isBuy ? "买入信号" : "卖出信号"),
+          value: isBuy ? "B" : "S",
+          xAxis: dataIdx,
+          yAxis: isBuy ? data[dataIdx].low : data[dataIdx].high,
+          itemStyle: { color: isBuy ? "#10b981" : "#ef4444" },
+          // 悬浮显示详细理由
+          tooltip: {
+            formatter: `<b>${t.date} ${isBuy ? "买入" : "卖出"}</b><br/>成交价: ${t.price}<br/>理由: ${t.reason || "系统信号"}`
+          }
         });
       }
     });
@@ -672,6 +673,18 @@ const renderChart = (data: any[]) => {
           let color = changeNum >= 0 ? "#10b981" : "#ef4444";
           let sign = changeNum > 0 ? "+" : "";
           res += `<div style="margin-bottom: 4px;"><span style="color: ${color}; font-weight: bold; font-size: 13px;">涨幅: ${sign}${changeStr}%</span></div>`;
+        }
+
+        // --- 核心修复：查找当前日期是否有交易，并注入理由 ---
+        const currentTrade = trades.value.find(
+          (t) => t.date === params[0].axisValue
+        );
+        if (currentTrade) {
+          const tColor = currentTrade.type === "BUY" ? "#10b981" : "#ef4444";
+          res += `<div style="margin: 8px 0; padding: 6px 10px; background: ${tColor}15; border-left: 4px solid ${tColor}; border-radius: 4px;">`;
+          res += `<div style="font-weight: bold; color: ${tColor}; font-size: 12px; margin-bottom: 2px;">${currentTrade.type === "BUY" ? "🟢 买入执行" : "🔴 卖出执行"}</div>`;
+          res += `<div style="font-size: 11px; color: #cbd5e1;">理由: ${currentTrade.reason || "系统信号"}</div>`;
+          res += `</div>`;
         }
 
         params.forEach((item: any) => {
@@ -1055,19 +1068,29 @@ onUnmounted(() => {
           <div class="text-xl font-black flex items-center gap-2">
             <!-- 优先显示实时分时诊断信号 -->
             <template v-if="realtimeSignal">
+              <!-- 特殊预警：日线与分时背离 (如日线已提示止盈，但分时还处于震荡) -->
               <span
-                v-if="realtimeSignal.ai_signal === 1"
+                v-if="realtimeSignal.is_divergent"
+                class="text-amber-400 animate-pulse flex items-center gap-1"
+              >
+                <AlertTriangle class="w-5 h-5" />
+                {{ realtimeSignal.action || "战略背离：建议止盈" }}
+              </span>
+              <span
+                v-else-if="realtimeSignal.ai_signal === 1"
                 class="text-emerald-400 animate-pulse"
               >
-                分时看多：建议介入
+                {{ realtimeSignal.action || "分时看多：建议介入" }}
               </span>
               <span
                 v-else-if="realtimeSignal.ai_signal === -1"
                 class="text-rose-400 animate-pulse"
               >
-                分时看空：建议离场
+                {{ realtimeSignal.action || "分时看空：建议离场" }}
               </span>
-              <span v-else class="text-slate-400"> 分时震荡：保持观望 </span>
+              <span v-else class="text-slate-400">
+                {{ realtimeSignal.action || "分时震荡：保持观望" }}
+              </span>
             </template>
             <!-- 降级显示回测最后信号 -->
             <template v-else-if="lastSignal.signal === 1">
@@ -1287,8 +1310,12 @@ onUnmounted(() => {
         </div>
 
         <!-- 策略微调面板 -->
-        <div class="glass p-6 rounded-3xl border border-white/5 flex-1 flex flex-col">
-          <h3 class="text-xl font-semibold mb-6 flex items-center gap-2 shrink-0">
+        <div
+          class="glass p-6 rounded-3xl border border-white/5 flex-1 flex flex-col"
+        >
+          <h3
+            class="text-xl font-semibold mb-6 flex items-center gap-2 shrink-0"
+          >
             <ShieldAlert class="w-5 h-5 text-indigo-400" /> 策略配置
           </h3>
           <div class="space-y-6 flex-1 flex flex-col">

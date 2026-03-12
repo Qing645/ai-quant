@@ -131,7 +131,7 @@ const handleSubmit = async () => {
           <TrendingUp class="w-8 h-8 text-white" />
         </div>
         <h1 class="text-3xl font-black text-white tracking-tighter">
-          Local AI Quant
+          AI Quant
         </h1>
         <p
           class="text-slate-500 text-sm mt-1 uppercase tracking-widest font-bold"
