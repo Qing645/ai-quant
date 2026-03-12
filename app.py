@@ -15,6 +15,8 @@ import data_fetcher
 import feature_engineer
 import model_trainer
 import backtest_engine
+import backtest_analyzer
+import market_insight
 import auth
 from auth import get_current_user
 from sqlalchemy.orm import Session
@@ -47,6 +49,10 @@ MODEL_CACHE = None
 DATA_CACHE = None
 CACHE_TIMESTAMP = 0
 CACHE_EXPIRE = 120 # 数据缓存 2 分钟 (对于 30 秒轮询足够)
+
+# 洞察数据缓存 (缓存 5 分钟)
+INSIGHT_CACHE = {"data": None, "ts": 0}
+INSIGHT_TTL = 300 
 
 @app.get("/api/health")
 def health_check():
@@ -155,7 +161,10 @@ async def run_pipeline(
             os.remove("portfolio_nav.csv")
             
         # 支持批量处理
-        symbols = [s.strip().upper() for s in symbol.split(",")]
+        symbols = [s.strip().upper() for s in symbol.split(",") if s.strip()]
+        if not symbols:
+            raise HTTPException(status_code=400, detail="请提供有效的股票代码")
+            
         success_list = []
         symbol_data_map = {} # 用于存储多标的数据路径映射
         
@@ -169,26 +178,38 @@ async def run_pipeline(
         fetch_end = (end_dt + timedelta(days=1)).strftime("%Y-%m-%d")
         
         for s in symbols:
-            print(f"\n>>>> 正在为 {s} 启动量化管线分步任务...")
-            # 为不同标的分离文件路径，防止覆盖
-            s_data_file = f"data_{s}.csv"
-            s_processed_file = f"processed_{s}.csv"
-            s_model_file = f"model_{s}.joblib"
-            s_backtest_file = f"backtest_{s}.csv"
-            
-            # 1. 下载数据
-            data_fetcher.fetch_data(s, start, fetch_end, s_data_file)
-            
-            # 2. 特征工程
-            raw_df = pd.read_csv(s_data_file)
-            processed_df = feature_engineer.prepare_features(raw_df, prediction_window=prediction_days)
-            processed_df.to_csv(s_processed_file, index=False)
-            
-            # 3. 模型训练
-            model_trainer.train_model(s_processed_file, s_model_file, s_backtest_file)
-            
-            symbol_data_map[s] = s_backtest_file
-            success_list.append(s)
+            try:
+                print(f"\n>>>> 正在为 {s} 启动量化管线分步任务...")
+                # 为不同标的分离文件路径，防止覆盖
+                s_data_file = f"data_{s}.csv"
+                s_processed_file = f"processed_{s}.csv"
+                s_model_file = f"model_{s}.joblib"
+                s_backtest_file = f"backtest_{s}.csv"
+                
+                # 1. 下载数据
+                data_fetcher.fetch_data(s, start, fetch_end, s_data_file)
+                
+                # 2. 特征工程
+                if not os.path.exists(s_data_file): continue
+                raw_df = pd.read_csv(s_data_file)
+                if raw_df.empty: continue
+                
+                processed_df = feature_engineer.prepare_features(raw_df, prediction_window=prediction_days)
+                if processed_df.empty: continue
+                processed_df.to_csv(s_processed_file, index=False)
+                
+                # 3. 模型训练
+                model_trainer.train_model(s_processed_file, s_model_file, s_backtest_file)
+                
+                symbol_data_map[s] = s_backtest_file
+                success_list.append(s)
+            except Exception as inner_e:
+                print(f"  [Error] 标的 {s} 处理失败，跳过: {inner_e}")
+                continue
+
+        # 检查是否至少有一个标的处理成功
+        if not success_list:
+            raise HTTPException(status_code=404, detail="所选标的均无法获取有效数据，请检查代码或扩大日期范围。")
             
         # 兼容单标的模式的旧缓存路径逻辑
         if len(symbols) == 1:
@@ -231,10 +252,20 @@ async def run_pipeline(
                 user_id=current_user.id
             )
             
+        # 5. 生成智能分析报告
+        try:
+            with open(METRICS_FILE, 'r') as f: m_data = json.load(f)
+            with open(TRADES_FILE, 'r') as f: t_data = json.load(f)
+            report_md = backtest_analyzer.generate_analysis_report(m_data, t_data)
+            with open("analysis_report.md", "w") as f: f.write(report_md)
+        except Exception as e:
+            print(f"  [Error] Analysis generation failed: {e}")
+            report_md = "报告生成失败，请检查回测数据。"
+
         return {
-            "message": "Portfolio pipeline completed" if len(symbols) > 1 else "Single pipeline completed", 
+            "status": "success", 
             "symbols": success_list,
-            "mode": "portfolio" if len(symbols) > 1 else "single"
+            "report": report_md
         }
     except Exception as e:
         import traceback
@@ -394,8 +425,27 @@ def _translate_to_chinese(text: str) -> str:
             translated = "".join([sent[0] for sent in res_json[0] if sent[0]])
             return translated
     except Exception as e:
-        print(f"翻译失败: {e}")
-    return text
+        print(f"数据获取失败: {e}")
+        return []
+
+@app.get("/api/market/insights")
+async def get_market_insights():
+    """获取市场洞察：新闻、板块、推荐"""
+    global INSIGHT_CACHE
+    import time
+    now = time.time()
+    
+    if INSIGHT_CACHE["data"] and now - INSIGHT_CACHE["ts"] < INSIGHT_TTL:
+        return INSIGHT_CACHE["data"]
+        
+    try:
+        # 在异步环境下调用同步抓取 (考虑未来使用 run_in_executor)
+        data = market_insight.get_market_insights()
+        INSIGHT_CACHE = {"data": data, "ts": now}
+        return data
+    except Exception as e:
+        print(f"Insight error: {e}")
+        return {"news": [], "sectors": [], "recommendations": [], "error": str(e)}
 
 @app.get("/api/realtime/check")
 async def check_realtime_signal(symbol: str = "159915.SZ"):
@@ -488,8 +538,8 @@ async def check_realtime_signal(symbol: str = "159915.SZ"):
             "status": "success",
             "symbol": symbol,
             "current_price": round(float(quote['close']), 3),
-            "change_pct": round(((quote['close'] - quote.get('prev_close', quote['open'])) / quote.get('prev_close', quote['open'])) * 100, 2) if quote.get('prev_close', quote['open']) != 0 else 0,
-            "prev_close": round(float(quote.get('prev_close', quote['open'])), 3),
+            "change_pct": round(((quote['close'] - quote.get('prev_close', 0)) / quote.get('prev_close', 1)) * 100, 2) if quote.get('prev_close', 0) != 0 else 0,
+            "prev_close": round(float(quote.get('prev_close', 0)), 3),
             "ai_confidence": round(float(prob), 4),
             "threshold_ref": round(float(threshold), 4),
             "signal": signal,

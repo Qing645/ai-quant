@@ -6,6 +6,8 @@ def prepare_features(df, prediction_window=10):
     特征工程 4.0 (专业量化因子库)
     """
     # 确保列名正确且为小写
+    if df.empty:
+        return pd.DataFrame()
     if isinstance(df.columns, pd.MultiIndex):
         df.columns = [col[0] for col in df.columns]
     df.columns = [str(col).lower() for col in df.columns]

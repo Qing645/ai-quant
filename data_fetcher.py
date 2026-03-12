@@ -57,154 +57,144 @@ def save_to_db(df, symbol):
 
 def fetch_realtime_quote(symbol):
     """
-    获取股票/ETF 的实时快照行情 (性能优化版：带 15s 缓存)
+    获取股票/ETF 的实时快照行情
+    增加智能昨收价 (prev_close) 提取逻辑：排除 CSV 中已有的今日日线干扰
     """
-    global SPOT_CACHE_STOCK, SPOT_CACHE_ETF, STOCK_TIMESTAMP, ETF_TIMESTAMP
     import akshare as ak
+    import yfinance as yf
     
     original_symbol = symbol.strip().upper()
     is_china_market = original_symbol.endswith((".SS", ".SZ", ".SH", ".BJ"))
+    today_str = datetime.now().strftime('%Y-%m-%d')
     
+    # --- A. 智能获取真正的“昨收价” (Previous Close) ---
+    prev_close_val = 0.0
+    try:
+        # 兜底 1: 本地 CSV (排除今日数据)
+        data_file = f"data_{original_symbol}.csv"
+        if os.path.exists(data_file):
+            df_hist = pd.read_csv(data_file)
+            if not df_hist.empty:
+                df_prev = df_hist[df_hist['date'].astype(str) < today_str]
+                if not df_prev.empty:
+                    prev_close_val = float(df_prev.iloc[-1]['close'])
+                else:
+                    prev_close_val = float(df_hist.iloc[0]['open'])
+        
+        # 兜底 2: yfinance fast_info (极度可靠的实时昨收源)
+        if prev_close_val <= 0:
+            yf_symbol = original_symbol
+            if is_china_market:
+                if original_symbol.endswith(".SH"): yf_symbol = original_symbol.replace(".SH", ".SS")
+            tk = yf.Ticker(yf_symbol)
+            # 使用 fast_info 避免昂贵的 history 请求
+            prev_close_val = float(tk.fast_info.get('previous_close', 0))
+    except Exception as e:
+        print(f"  [Fetcher] 提取昨收失败 ({original_symbol}): {e}")
+
+    # --- B. 获取当前实时价格 ---
+    latest_price = 0.0
+    now_time = datetime.now().strftime('%H:%M')
+    
+    # 尝试源 1: AkShare
     if is_china_market:
         code = ''.join(filter(str.isdigit, original_symbol))
-        is_etf = code.startswith(('15', '51', '56', '58'))
-        now = time.time()
-        
         try:
-            if is_etf:
-                if SPOT_CACHE_ETF is None or (now - ETF_TIMESTAMP > CACHE_TTL):
-                    SPOT_CACHE_ETF = ak.fund_etf_spot_em()
-                    ETF_TIMESTAMP = now
-                df_spot = SPOT_CACHE_ETF
-                row = df_spot[df_spot['代码'] == code]
-            else:
-                if SPOT_CACHE_STOCK is None or (now - STOCK_TIMESTAMP > CACHE_TTL):
-                    # 股票快照使用 stock_zh_a_spot (带时间戳)
-                    SPOT_CACHE_STOCK = ak.stock_zh_a_spot()
-                    STOCK_TIMESTAMP = now
-                df_spot = SPOT_CACHE_STOCK
-                row = df_spot[df_spot['代码'] == (code if code.startswith('bj') else original_symbol.replace('.SS', 'sh').replace('.SZ', 'sz').lower())]
-                if row.empty: # 兜底逻辑：如果拼凑代码失败，搜索纯代码
-                     row = df_spot[df_spot['代码'].str.contains(code)]
+            info_df = ak.stock_individual_info_em(symbol=code)
+            info_map = dict(zip(info_df['item'], info_df['value']))
+            latest_price = float(info_map.get('最新', 0))
+        except:
+            pass
 
-            if not row.empty:
-                # 提取时间戳
-                quote_time = ""
-                if is_etf:
-                    # ETF: '更新时间' 为 14:55:54+0800 格式
-                    raw_time = str(row['更新时间'].iloc[0])
-                    if ' ' in raw_time:
-                         quote_time = raw_time.split(' ')[1][:5]
-                else:
-                    # 股票: '时间戳' 为 15:00:11 格式
-                    quote_time = str(row['时间戳'].iloc[0])[:5]
-
-                if is_etf:
-                    return {
-                        'date': datetime.now().strftime('%Y-%m-%d'),
-                        'time': quote_time,
-                        'open': float(row['开盘价'].iloc[0]),
-                        'close': float(row['最新价'].iloc[0]),
-                        'high': float(row['最高价'].iloc[0]),
-                        'low': float(row['最低价'].iloc[0]),
-                        'volume': float(row['成交量'].iloc[0]),
-                        'prev_close': float(row['昨收'].iloc[0])
-                    }
-                else:
-                    return {
-                        'date': datetime.now().strftime('%Y-%m-%d'),
-                        'time': quote_time,
-                        'open': float(row['今开'].iloc[0]),
-                        'close': float(row['最新价'].iloc[0]),
-                        'high': float(row['最高'].iloc[0]),
-                        'low': float(row['最低'].iloc[0]),
-                        'volume': float(row['成交量'].iloc[0]),
-                        'prev_close': float(row['昨收'].iloc[0])
-                    }
-        except Exception as e:
-            print(f"获取国内实时行情失败: {e}")
-    else:
+    # 尝试源 2: yfinance (如果 Ak 失败或不是中国市场)
+    if latest_price <= 0:
         try:
-            ticker = yf.Ticker(original_symbol)
+            yf_symbol = original_symbol
+            if is_china_market and original_symbol.endswith(".SH"):
+                yf_symbol = original_symbol.replace(".SH", ".SS")
+            ticker = yf.Ticker(yf_symbol)
             hist = ticker.history(period="1d")
-            info = ticker.info
             if not hist.empty:
-                return {
-                    'date': datetime.now().strftime('%Y-%m-%d'),
-                    'time': datetime.now().strftime('%H:%M'),
-                    'open': float(hist['Open'].iloc[-1]),
-                    'close': float(hist['Close'].iloc[-1]),
-                    'high': float(hist['High'].iloc[-1]),
-                    'low': float(hist['Low'].iloc[-1]),
-                    'volume': float(hist['Volume'].iloc[-1]),
-                    'prev_close': float(info.get('previousClose', hist['Open'].iloc[-1]))
-                }
-        except Exception as e:
-            print(f"获取国际实时行情失败: {e}")
-            
+                latest_price = float(hist.iloc[-1]['Close'])
+        except:
+            pass
+
+    # --- C. 组装结果 ---
+    if latest_price > 0:
+        return {
+            'date': today_str,
+            'time': now_time,
+            'open': latest_price,
+            'close': latest_price,
+            'high': latest_price,
+            'low': latest_price,
+            'volume': 0.0,
+            'prev_close': prev_close_val # 改动：不在此处做 latest_price 兜底，交给调用者处理
+        }
+        
     return None
 
 def fetch_intraday_data(symbol):
     """
-    获取今日分时数据 (1分钟精度) - 带 15s 缓存
+    获取今日分时数据 (1分钟精度) - 双源备份
     """
     global INTRADAY_CACHE
     import akshare as ak
+    import yfinance as yf
     
     original_symbol = symbol.strip().upper()
     is_china_market = original_symbol.endswith((".SS", ".SZ", ".SH", ".BJ"))
-    
     now = time.time()
+    
     if original_symbol in INTRADAY_CACHE:
         cache_ts, cache_data = INTRADAY_CACHE[original_symbol]
         if now - cache_ts < CACHE_TTL:
             return cache_data
-            
+
     try:
         if is_china_market:
             code = ''.join(filter(str.isdigit, original_symbol))
-            is_etf = code.startswith(('15', '51', '56', '58'))
-            
-            print(f"  [Fetcher] 正在拉取 {original_symbol} 分时数据...")
-            if is_etf:
-                df = ak.fund_etf_hist_min_em(symbol=code, period='1', adjust="qfq")
-            else:
-                df = ak.stock_zh_a_hist_min_em(symbol=code, period='1', adjust="qfq")
-            
-            if df is not None and not df.empty:
-                today_str = datetime.now().strftime('%Y-%m-%d')
-                df['时间项目'] = pd.to_datetime(df['时间'])
-                df_today = df[df['时间项目'].dt.strftime('%Y-%m-%d') == today_str]
+            try:
+                # 判定标的类型，动态切换接口 (股票 vs ETF)
+                if original_symbol.startswith(("15", "51", "56", "58")):
+                    df = ak.fund_etf_hist_min_em(symbol=code, period='1')
+                else:
+                    df = ak.stock_zh_a_hist_min_em(symbol=code, period='1', start_date='09:30:00')
                 
-                if df_today.empty:
-                    df_today = df.tail(240)
-                
-                result = [
-                    {
-                        'time': row['时间项目'].strftime('%H:%M'),
-                        'price': float(row['收盘']),
-                        'volume': float(row['成交量'])
-                    } for _, row in df_today.iterrows()
-                ]
-                INTRADAY_CACHE[original_symbol] = (now, result)
-                return result
-        else:
-            ticker = yf.Ticker(original_symbol)
-            df = ticker.history(period='1d', interval='1m')
-            if not df.empty:
-                result = [
-                    {
-                        'time': idx.strftime('%H:%M'),
-                        'price': float(row['Close']),
-                        'volume': float(row['Volume'])
-                    } for idx, row in df.iterrows()
-                ]
-                INTRADAY_CACHE[original_symbol] = (now, result)
-                return result
+                if df is not None and not df.empty:
+                    today_str = datetime.now().strftime('%Y-%m-%d')
+                    # 统一时间列处理
+                    time_col = '时间' if '时间' in df.columns else df.columns[0]
+                    df['时间项目'] = pd.to_datetime(df[time_col])
+                    df_today = df[df['时间项目'].dt.strftime('%Y-%m-%d') == today_str]
+                    if df_today.empty: df_today = df.tail(240)
+                    
+                    price_col = '收盘' if '收盘' in df.columns else 'close'
+                    vol_col = '成交量' if '成交量' in df.columns else 'volume'
+                    
+                    result = [{'time': row['时间项目'].strftime('%H:%M'), 'price': float(row[price_col]), 'volume': float(row[vol_col])} for _, row in df_today.iterrows()]
+                    INTRADAY_CACHE[original_symbol] = (now, result)
+                    return result
+            except Exception as ak_e:
+                # 静默处理频繁出现的连接中断，避免日志过载
+                pass 
+
+        # --- yfinance 备用 (支持全球包含 A 股) ---
+        yf_symbol = original_symbol
+        if is_china_market:
+            if original_symbol.endswith(".SH"): yf_symbol = original_symbol.replace(".SH", ".SS")
+        
+        ticker = yf.Ticker(yf_symbol)
+        df = ticker.history(period='1d', interval='1m')
+        if not df.empty:
+            result = [{'time': idx.strftime('%H:%M'), 'price': float(row['Close']), 'volume': float(row['Volume'])} for idx, row in df.iterrows()]
+            INTRADAY_CACHE[original_symbol] = (now, result)
+            return result
+            
     except Exception as e:
         print(f"获取分时数据失败 ({symbol}): {e}")
-        
     return []
+
 
 def fetch_data(symbol, start_date, end_date, output_path):
     """历史数据拉取"""

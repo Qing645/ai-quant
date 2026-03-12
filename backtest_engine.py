@@ -83,12 +83,17 @@ def run_backtest(data_path, output_metrics_path="metrics.json", output_trades_pa
     peak_price_since_entry = 0.0
     account_peak = initial_capital
     is_halted = False # 账户风险熔断状态
+    halt_days_remaining = 0 # 冷静期计数器
     
     # 预计算 120 日均线用于趋势择时
     df['ma_120'] = df['close'].rolling(window=120).mean()
     loss_threshold = abs(float(stop_loss))
     
     for i in range(len(df)):
+        # 更新熔断冷静期
+        if halt_days_remaining > 0:
+            halt_days_remaining -= 1
+        is_halted = (halt_days_remaining > 0)
         current_price = float(df.iloc[i]['close'])
         signal = int(df.iloc[i]['predicted_signal'])
         current_date = str(df.iloc[i]['date'])
@@ -104,6 +109,7 @@ def run_backtest(data_path, output_metrics_path="metrics.json", output_trades_pa
         account_drawdown = (account_peak - current_value) / (account_peak + 1e-8)
         
         if not is_halted and account_drawdown > max_account_drawdown:
+            halt_days_remaining = 20 # 20天冷静期
             is_halted = True
             if position > 0:
                 # 触发熔断，立即平仓
@@ -111,15 +117,17 @@ def run_backtest(data_path, output_metrics_path="metrics.json", output_trades_pa
                 gross_amount = position * exec_price
                 commission = max(MIN_COMMISSION, gross_amount * COMMISSION_RATE) if not is_etf else gross_amount * COMMISSION_RATE
                 stamp_duty = gross_amount * STAMP_DUTY_RATE
-                capital += gross_amount - (commission + stamp_duty) # 修复：应该是增加资产，而非覆盖
+                capital += gross_amount - (commission + stamp_duty) 
                 position = 0
                 trades.append({
                     "date": current_date,
                     "type": "SELL",
                     "price": round(exec_price, 4),
-                    "reason": "Account Circuit Breaker",
+                    "reason": "Dynamic Circuit Breaker (20d cooling)",
                     "fee": round(commission + stamp_duty, 2)
                 })
+            # 重置峰值，准备在冷静期后重新计算基准
+            account_peak = current_value
         
         if is_halted:
             continue
@@ -282,6 +290,7 @@ def run_portfolio_backtest(data_map, output_metrics_path="portfolio_metrics.json
     portfolio_values = []
     all_trades = []
     is_halted = False
+    halt_days_remaining = 0  # 冷静期计数器
     account_peak = initial_capital
     loss_threshold = abs(float(stop_loss))
     
@@ -291,6 +300,11 @@ def run_portfolio_backtest(data_map, output_metrics_path="portfolio_metrics.json
     SLIPPAGE_RATE = 0.0005
     
     for current_date in sorted_dates:
+        # 更新熔断冷静期状态
+        if halt_days_remaining > 0:
+            halt_days_remaining -= 1
+        is_halted = (halt_days_remaining > 0)
+        
         current_daily_value = capital
         potential_buys = []
         
@@ -348,7 +362,9 @@ def run_portfolio_backtest(data_map, output_metrics_path="portfolio_metrics.json
         account_drawdown = (account_peak - current_daily_value) / (account_peak + 1e-8)
         
         if not is_halted and account_drawdown > max_account_drawdown:
+            halt_days_remaining = 20 # 进入 20 个交易日的冷静期
             is_halted = True
+            
             # 强制清空组合
             for s in data_map:
                 state = portfolio_state[s]
@@ -357,12 +373,15 @@ def run_portfolio_backtest(data_map, output_metrics_path="portfolio_metrics.json
                     p = float(row['close'])
                     is_etf = any(s.startswith(pre) for pre in ['15', '51', '56', '58'])
                     duty = 0 if is_etf else p * state["position"] * STAMP_DUTY_RATE
-                    comm = 0 if is_etf else 5.0 # 简化处理
+                    comm = 0 if is_etf else 5.0 
                     capital += (state["position"] * p * (1 - SLIPPAGE_RATE)) - (comm + duty)
                     all_trades.append({
-                        "date": current_date, "symbol": s, "type": "SELL", "price": round(p, 4), "reason": "Account Circuit Breaker", "fee": round(comm + duty, 2)
+                        "date": current_date, "symbol": s, "type": "SELL", "price": round(p, 4), "reason": "Dynamic Circuit Breaker (20d cooling)", "fee": round(comm + duty, 2)
                     })
                     state["position"] = 0.0
+            
+            # 关键：熔断触发后重置最高点，确保冷静期结束后是以当前净值为新基准重新计算风险
+            account_peak = current_daily_value
                     
         # C. 执行买入 (资金分配：若多个信号，平分可用投资资金)
         if potential_buys and not is_halted:
