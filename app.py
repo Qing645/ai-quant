@@ -1,6 +1,7 @@
 from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect, Depends, Query
 from fastapi.middleware.cors import CORSMiddleware
 from sqlalchemy.exc import IntegrityError
+from pydantic import BaseModel
 import pandas as pd
 import os
 import json
@@ -26,10 +27,23 @@ app = FastAPI(title="AI Quant API")
 # 初始化数据库
 init_db()
 
+class SendCodeRequest(BaseModel):
+    email: str
+
+class RegisterRequest(BaseModel):
+    email: str
+    password: str
+    code: str
+
+class LoginRequest(BaseModel):
+    email: str
+    password: str
+
 # 允许跨域访问
+CORS_ORIGINS = [o.strip() for o in os.getenv("CORS_ORIGINS", "http://localhost:5173").split(",") if o.strip()]
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=CORS_ORIGINS,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -54,17 +68,29 @@ CACHE_EXPIRE = 120 # 数据缓存 2 分钟 (对于 30 秒轮询足够)
 INSIGHT_CACHE = {"data": None, "ts": 0}
 INSIGHT_TTL = 300 
 
+def _validate_symbol(raw: str) -> str:
+    symbol = raw.strip().upper()
+    if not symbol:
+        raise HTTPException(status_code=400, detail="请提供有效的股票代码")
+    if ".." in symbol or "/" in symbol or "\\" in symbol:
+        raise HTTPException(status_code=400, detail="股票代码格式不正确")
+    for ch in symbol:
+        if not (ch.isalnum() or ch in "._-"):
+            raise HTTPException(status_code=400, detail="股票代码格式不正确")
+    return symbol
+
 @app.get("/api/health")
 def health_check():
     return {"status": "healthy"}
 
 @app.post("/api/auth/send-code")
-async def send_code(email: str = Query(...), db: Session = Depends(database.get_db)):
+async def send_code(payload: SendCodeRequest, db: Session = Depends(database.get_db)):
     """生成验证码并模拟发送"""
     import random
     from datetime import datetime, timedelta
     
     # 简单的邮箱格式校验
+    email = payload.email
     if "@" not in email:
         raise HTTPException(status_code=400, detail="邮箱格式不正确")
     
@@ -93,10 +119,13 @@ async def send_code(email: str = Query(...), db: Session = Depends(database.get_
     return {"message": "验证码已发送，请查看终端输出"}
 
 @app.post("/api/auth/register")
-async def register(email: str = Query(...), password: str = Query(...), code: str = Query(...), db: Session = Depends(database.get_db)):
+async def register(payload: RegisterRequest, db: Session = Depends(database.get_db)):
     """用户注册 (基于邮件验证码)"""
     from datetime import datetime
     try:
+        email = payload.email
+        password = payload.password
+        code = payload.code
         # 1. 验证码校验
         vc = db.query(database.VerificationCode).filter(
             database.VerificationCode.email == email,
@@ -128,8 +157,10 @@ async def register(email: str = Query(...), password: str = Query(...), code: st
         raise HTTPException(status_code=500, detail=f"注册失败: {str(e)}")
 
 @app.post("/api/auth/login")
-async def login(email: str = Query(...), password: str = Query(...), db: Session = Depends(database.get_db)):
+async def login(payload: LoginRequest, db: Session = Depends(database.get_db)):
     """用户登录 (支持邮箱)"""
+    email = payload.email
+    password = payload.password
     user = db.query(database.User).filter(database.User.email == email).first()
     if not user or not auth.verify_password(password, user.hashed_password):
         raise HTTPException(status_code=401, detail="邮箱或密码错误")
@@ -161,7 +192,7 @@ async def run_pipeline(
             os.remove("portfolio_nav.csv")
             
         # 支持批量处理
-        symbols = [s.strip().upper() for s in symbol.split(",") if s.strip()]
+        symbols = [_validate_symbol(s) for s in symbol.split(",") if s.strip()]
         if not symbols:
             raise HTTPException(status_code=400, detail="请提供有效的股票代码")
             
@@ -324,6 +355,7 @@ def get_model_metrics():
 async def get_intraday_data(symbol: str):
     """获取标的分时数据，并附加实时最新价格对齐 (Live Tick-to-Min)"""
     try:
+        symbol = _validate_symbol(symbol)
         data = data_fetcher.fetch_intraday_data(symbol)
         quote = data_fetcher.fetch_realtime_quote(symbol)
         
@@ -465,6 +497,7 @@ async def check_realtime_signal(symbol: str = "159915.SZ"):
             
     try:
         # 2. 获取实时行情
+        symbol = _validate_symbol(symbol)
         quote = data_fetcher.fetch_realtime_quote(symbol)
         if not quote:
             return {"status": "error", "message": "无法获取实时行情"}

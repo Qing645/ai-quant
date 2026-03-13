@@ -46,12 +46,11 @@ const sendCode = async () => {
   try {
     isLoading.value = true;
     errorMsg.value = "";
-    const res = await fetch(
-      `/api/auth/send-code?email=${encodeURIComponent(email.value)}`,
-      {
-        method: "POST"
-      }
-    );
+    const res = await fetch("/api/auth/send-code", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ email: email.value })
+    });
     const data = await res.json();
     if (res.ok) {
       startCountdown();
@@ -76,15 +75,16 @@ const handleSubmit = async () => {
   isLoading.value = true;
 
   try {
-    const params = new URLSearchParams({
-      email: email.value,
-      password: password.value,
-      ...(isLogin.value ? {} : { code: code.value })
-    });
-
     const endpoint = isLogin.value ? "/api/auth/login" : "/api/auth/register";
-    const res = await fetch(`${endpoint}?${params.toString()}`, {
-      method: "POST"
+    const payload: Record<string, string> = {
+      email: email.value,
+      password: password.value
+    };
+    if (!isLogin.value) payload.code = code.value;
+    const res = await fetch(endpoint, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(payload)
     });
 
     const data = await res.json();

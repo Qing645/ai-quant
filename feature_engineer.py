@@ -87,7 +87,8 @@ def prepare_features(df, prediction_window=10):
         'atr_20', 'body_size', 'upper_shadow', 'vol_ratio', 'bb_p', 'roc',
         'obv_roc', 'vpt_roc', 'vol_spike', 'momentum_accel'
     ]
-    df[feature_cols] = df[feature_cols].bfill().ffill()
+    # 仅使用向前填充，避免未来数据泄漏
+    df[feature_cols] = df[feature_cols].ffill()
     df.replace([np.inf, -np.inf], 0, inplace=True)
     df.dropna(subset=feature_cols, inplace=True)
     

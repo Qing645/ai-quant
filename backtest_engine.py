@@ -147,9 +147,9 @@ def run_backtest(data_path, output_metrics_path="metrics.json", output_trades_pa
                 exec_price = current_price * (1 + SLIPPAGE_RATE)
                 # 仓位比例控制逻辑：仅投入 capital * pos_ratio 的资金
                 invest_amount = capital * pos_ratio
-                if invest_amount > MIN_COMMISSION:
-                    position = (invest_amount - MIN_COMMISSION if not is_etf else invest_amount) / exec_price
-                    real_commission = max(MIN_COMMISSION, invest_amount * COMMISSION_RATE) if not is_etf else invest_amount * COMMISSION_RATE
+                real_commission = (max(MIN_COMMISSION, invest_amount * COMMISSION_RATE) if not is_etf else invest_amount * COMMISSION_RATE)
+                if invest_amount > real_commission:
+                    position = (invest_amount - real_commission) / exec_price
                     capital = capital - (position * exec_price) - real_commission
                     entry_price = exec_price
                     peak_price_since_entry = exec_price 
@@ -294,7 +294,7 @@ def run_portfolio_backtest(data_map, output_metrics_path="portfolio_metrics.json
     # 2. 状态初始化
     initial_capital = float(initial_capital)
     capital = initial_capital
-    portfolio_state = {s: {"position": 0.0, "entry_price": 0.0, "peak_price": 0.0, "sell_count": 0} for s in data_map}
+    portfolio_state = {s: {"position": 0.0, "entry_price": 0.0, "peak_price": 0.0, "sell_count": 0, "last_price": None} for s in data_map}
     
     portfolio_values = []
     all_trades = []
@@ -319,14 +319,21 @@ def run_portfolio_backtest(data_map, output_metrics_path="portfolio_metrics.json
         
         # A. 更新身价 & 检查卖出信号
         for s in data_map:
-            if current_date not in dfs[s].index: continue
-            
-            row = dfs[s].loc[current_date]
-            price = float(row['close'])
-            signal = int(row['predicted_signal'])
-            prob = float(row.get('prediction_prob', 0.5))
-            atr = float(row.get('atr_20', 0))
-            ma_120 = row['ma_120']
+            has_row = current_date in dfs[s].index
+            if has_row:
+                row = dfs[s].loc[current_date]
+                price = float(row['close'])
+                signal = int(row['predicted_signal'])
+                prob = float(row.get('prediction_prob', 0.5))
+                atr = float(row.get('atr_20', 0))
+                ma_120 = row['ma_120']
+            else:
+                row = None
+                price = None
+                signal = 0
+                prob = 0.5
+                atr = 0.0
+                ma_120 = np.nan
             
             # 兼容 ETF 费用逻辑
             is_etf = any(s.startswith(pre) for pre in ['15', '51', '56', '58'])
@@ -334,49 +341,55 @@ def run_portfolio_backtest(data_map, output_metrics_path="portfolio_metrics.json
             s_min_comm = 0.0 if is_etf else 5.0
             
             state = portfolio_state[s]
+            if has_row and price is not None:
+                state["last_price"] = price
             if state["position"] > 0:
-                current_daily_value += state["position"] * price
-                state["peak_price"] = max(state["peak_price"], price)
+                ref_price = price if price is not None else state["last_price"]
+                if ref_price is not None:
+                    current_daily_value += state["position"] * ref_price
+                    state["peak_price"] = max(state["peak_price"], ref_price)
                 
-                # 检查卖出条件
-                trailing_stop = price < state["peak_price"] * (1 - loss_threshold)
-                profit_protect = ( (price - state["entry_price"])/state["entry_price"] < 0.04 and state["peak_price"] > state["entry_price"] * 1.12 )
-                
-                state["sell_count"] = state["sell_count"] + 1 if signal == 0 else 0
-                
-                # 动态宽限期补偿
-                row_full = dfs[s].loc[current_date]
-                mom_accel = float(row_full.get('momentum_accel', 0))
-                effective_grace = grace_period + 2 if mom_accel > 0.05 else grace_period
-                
-                signal_exit = (state["sell_count"] >= effective_grace)
-                atr_stop = use_atr_stop and atr > 0 and price < (state["entry_price"] - 2.5 * atr)
-                hard_stop = not use_atr_stop and price < state["entry_price"] * (1 - loss_threshold)
-                
-                exit_reason = ""
-                if trailing_stop: exit_reason = "移动止损触发"
-                elif profit_protect: exit_reason = "利润保护离场"
-                elif atr_stop: exit_reason = "ATR 自适应止损"
-                elif signal_exit: exit_reason = "AI 信号离场"
-                elif hard_stop: exit_reason = "固定百分比硬止损"
-
-                if exit_reason != "":
-                    # 执行卖出
-                    exec_p = price * (1 - SLIPPAGE_RATE)
-                    gross = state["position"] * exec_p
-                    comm = max(s_min_comm, gross * COMMISSION_RATE)
-                    duty = gross * s_stamp
-                    capital += gross - (comm + duty)
+                if has_row and price is not None:
+                    # 检查卖出条件
+                    trailing_stop = price < state["peak_price"] * (1 - loss_threshold)
+                    profit_protect = ( (price - state["entry_price"])/state["entry_price"] < 0.04 and state["peak_price"] > state["entry_price"] * 1.12 )
                     
-                    all_trades.append({
-                        "date": current_date, "symbol": s, "type": "SELL", "price": round(exec_p, 4), "reason": exit_reason, "fee": round(comm + duty, 2)
-                    })
-                    state["position"] = 0.0
+                    state["sell_count"] = state["sell_count"] + 1 if signal == 0 else 0
+                    
+                    # 动态宽限期补偿
+                    row_full = dfs[s].loc[current_date]
+                    mom_accel = float(row_full.get('momentum_accel', 0))
+                    effective_grace = grace_period + 2 if mom_accel > 0.05 else grace_period
+                    
+                    signal_exit = (state["sell_count"] >= effective_grace)
+                    atr_stop = use_atr_stop and atr > 0 and price < (state["entry_price"] - 2.5 * atr)
+                    hard_stop = not use_atr_stop and price < state["entry_price"] * (1 - loss_threshold)
+                    
+                    exit_reason = ""
+                    if trailing_stop: exit_reason = "移动止损触发"
+                    elif profit_protect: exit_reason = "利润保护离场"
+                    elif atr_stop: exit_reason = "ATR 自适应止损"
+                    elif signal_exit: exit_reason = "AI 信号离场"
+                    elif hard_stop: exit_reason = "固定百分比硬止损"
+
+                    if exit_reason != "":
+                        # 执行卖出
+                        exec_p = price * (1 - SLIPPAGE_RATE)
+                        gross = state["position"] * exec_p
+                        comm = max(s_min_comm, gross * COMMISSION_RATE)
+                        duty = gross * s_stamp
+                        capital += gross - (comm + duty)
+                        
+                        all_trades.append({
+                            "date": current_date, "symbol": s, "type": "SELL", "price": round(exec_p, 4), "reason": exit_reason, "fee": round(comm + duty, 2)
+                        })
+                        state["position"] = 0.0
             else:
                 # 检查买入条件（Smart Guard 穿透逻辑）
-                trend_ok = (not pd.isna(ma_120) and price > ma_120) or (prob >= 0.8)
-                if signal == 1 and trend_ok and not is_halted:
-                    potential_buys.append((s, price, is_etf, s_min_comm))
+                if has_row and price is not None:
+                    trend_ok = (not pd.isna(ma_120) and price > ma_120) or (prob >= 0.8)
+                    if signal == 1 and trend_ok and not is_halted:
+                        potential_buys.append((s, price, is_etf, s_min_comm))
 
         # B. 账户风险熔断检查
         portfolio_values.append(current_daily_value)
@@ -414,13 +427,13 @@ def run_portfolio_backtest(data_map, output_metrics_path="portfolio_metrics.json
                 
                 # 每个标的分到的预算
                 s_budget = total_invest_budget / len(potential_buys)
-                if s_budget > s_min_comm + 100: # 至少有 100 元可用
+                s_comm = max(s_min_comm, s_budget * COMMISSION_RATE)
+                if s_budget > s_comm + 100: # 至少有 100 元可用
                     exec_p = p * (1 + SLIPPAGE_RATE)
-                    s_pos = (s_budget - s_min_comm) / exec_p
-                    s_comm = max(s_min_comm, s_budget * COMMISSION_RATE)
+                    s_pos = (s_budget - s_comm) / exec_p
                     
                     capital -= (s_pos * exec_p) + s_comm
-                    portfolio_state[s].update({"position": s_pos, "entry_price": exec_p, "peak_price": exec_p, "sell_count": 0})
+                    portfolio_state[s].update({"position": s_pos, "entry_price": exec_p, "peak_price": exec_p, "sell_count": 0, "last_price": exec_p})
                     all_trades.append({
                         "date": current_date, "symbol": s, "type": "BUY", "price": round(exec_p, 4), "reason": f"AI Signal (Pos:{int(pos_ratio*100/len(potential_buys))}%)", "fee": round(s_comm, 2)
                     })

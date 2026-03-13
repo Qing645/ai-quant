@@ -38,6 +38,9 @@ npm install
 # 在项目根目录下执行
 source venv/bin/activate
 python app.py
+
+lsof -i :8000
+kill [PID]
 ```
 
 #### 第二步：启动前端看板 (Port: 5173)
